@@ -5,8 +5,8 @@
  *    Copyright 2000, Jeroen Vreeken
  *    This program is published under the GNU Public license
  */
-#include <math.h>
 #include "motion.h"
+#include <math.h>
 
 #ifdef HAVE_V4L2
 #include <linux/videodev2.h>

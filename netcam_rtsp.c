@@ -18,7 +18,6 @@
  *
  ***********************************************************/
 
-#include <stdio.h>
 #include "rotate.h"    /* already includes motion.h */
 #include "netcam_rtsp.h"
 
@@ -58,6 +57,7 @@ static void netcam_rtsp_null_context(netcam_context_ptr netcam){
     netcam->rtsp->frame          = NULL;
     netcam->rtsp->codec_context  = NULL;
     netcam->rtsp->format_context = NULL;
+    netcam->rtsp->resize_buffer  = NULL;
 
     netcam->rtsp->active = 0;
 }
@@ -74,6 +74,7 @@ static void netcam_rtsp_close_context(netcam_context_ptr netcam){
     if (netcam->rtsp->frame        != NULL) my_frame_free(netcam->rtsp->frame);
     if (netcam->rtsp->codec_context    != NULL) my_avcodec_close(netcam->rtsp->codec_context);
     if (netcam->rtsp->format_context   != NULL) avformat_close_input(&netcam->rtsp->format_context);
+    if (netcam->rtsp->resize_buffer    != NULL) av_free(netcam->rtsp->resize_buffer);
 
     netcam_rtsp_null_context(netcam);
 }
@@ -95,12 +96,24 @@ static int rtsp_decode_video(AVPacket *packet, AVFrame *frame, AVCodecContext *c
     }
 
     retcd = avcodec_receive_frame(ctx_codec, frame);
+
+    /* Ensure that we get a frame from every "key" packet
+     */
+    assert(!packet || retcd != AVERROR(EAGAIN) || !(packet->flags & AV_PKT_FLAG_KEY));
+
     if (retcd == AVERROR(EAGAIN)) return 0;
     if (retcd < 0) {
         av_strerror(retcd, errstr, sizeof(errstr));
         MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Error receiving frame from codec: %s", errstr);
         return -1;
     }
+
+    /* Ensure that "have an I-frame" corresponds exactly with
+     * "have a packet, and its 'key' flag is set"
+     */
+    assert((frame->pict_type == AV_PICTURE_TYPE_I) ==
+           (packet && packet->flags & AV_PKT_FLAG_KEY));
+
     return 1;
 
 #else
@@ -159,6 +172,10 @@ static int rtsp_decode_packet(AVPacket *packet, netcam_buff_ptr buffer, AVFrame 
 
     buffer->used = frame_size;
 
+    buffer->pts = packet ? packet->pts : -1;
+    if (packet && packet->flags & AV_PKT_FLAG_KEY)
+        buffer->is_key_frame = 1;
+
     return frame_size;
 }
 
@@ -192,6 +209,9 @@ static int netcam_open_codec(netcam_context_ptr netcam){
     }
     netcam->rtsp->video_stream_index = retcd;
     st = netcam->rtsp->format_context->streams[netcam->rtsp->video_stream_index];
+
+    /* Passthru mode needs this */
+    netcam->cnt->video_stream_index = retcd;
 
 #if (LIBAVFORMAT_VERSION_MAJOR >= 58) || ((LIBAVFORMAT_VERSION_MAJOR == 57) && (LIBAVFORMAT_VERSION_MINOR >= 41))
     decoder = avcodec_find_decoder(st->codecpar->codec_id);
@@ -343,6 +363,8 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
     AVPacket           packet;
     int                size_decoded;
 
+    assert(netcam->rtsp->codec_context != NULL);
+
     /* Point to our working buffer. */
     buffer = netcam->receiving;
     buffer->used = 0;
@@ -367,10 +389,25 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
         if (packet.stream_index == netcam->rtsp->video_stream_index)
             size_decoded = rtsp_decode_packet(&packet, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
 
-        my_packet_unref(packet);
+        /* Re-purpose the .pos field to store a packet serial number
+         */
+        packet.pos = netcam->rtsp->packet_serial++;
+
+        ffmpeg_packet_buffer_add(buffer->frame_pkts, &packet);
+#if 1
+fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] IN  \\\n",
+  packet.stream_index,
+  packet.pts,
+  packet.pos,
+  packet.flags & AV_PKT_FLAG_KEY ? 'I' : 'P');
+#endif
+
         av_init_packet(&packet);
         packet.data = NULL;
         packet.size = 0;
+#if 0 /* iskunk: not freeing the packet here when in passthru mode */
+        my_packet_unref(&packet);
+#endif
     }
     netcam->rtsp->status = RTSP_CONNECTED;
 
@@ -407,6 +444,8 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
 *
 */
 static int netcam_rtsp_resize_ntc(netcam_context_ptr netcam){
+
+    assert(netcam->rtsp->codec_context != NULL);
 
     if ((netcam->width  != (unsigned)netcam->rtsp->codec_context->width) ||
         (netcam->height != (unsigned)netcam->rtsp->codec_context->height) ||
@@ -479,6 +518,9 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
     netcam->rtsp->format_context->interrupt_callback.callback = netcam_interrupt_rtsp;
     netcam->rtsp->format_context->interrupt_callback.opaque = netcam;
 
+    /* Passthru mode needs the format context */
+    netcam->cnt->rtsp_format_context = netcam->rtsp->format_context;
+
     netcam->rtsp->interrupted = 0;
     if (gettimeofday(&netcam->rtsp->startreadtime, NULL) < 0) {
         MOTION_LOG(ERR, TYPE_NETCAM, SHOW_ERRNO, "%s: gettimeofday");
@@ -524,16 +566,17 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
      }
 
     retcd = avformat_open_input(&netcam->rtsp->format_context, netcam->rtsp->path, NULL, &opts);
+    av_dict_free(&opts);
     if ((retcd < 0) || (netcam->rtsp->interrupted == 1)){
         if (netcam->rtsp->status == RTSP_NOTCONNECTED){
             av_strerror(retcd, errstr, sizeof(errstr));
             MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: unable to open input(%s): %s", netcam->rtsp->netcam_url, errstr);
         }
-        av_dict_free(&opts);
         //The format context gets freed upon any error from open_input.
+        if (retcd == 0)
+            netcam_rtsp_close_context(netcam);
         return (retcd < 0) ? retcd : -1;
     }
-    av_dict_free(&opts);
 
     // fill out stream information
     retcd = avformat_find_stream_info(netcam->rtsp->format_context, NULL);
@@ -574,6 +617,8 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
         netcam_rtsp_close_context(netcam);
         return -1;
     }
+
+    assert(netcam->rtsp->codec_context != NULL);
 
     if (netcam->rtsp->codec_context->width <= 0 ||
         netcam->rtsp->codec_context->height <= 0)
@@ -707,7 +752,6 @@ static int netcam_rtsp_resize(netcam_context_ptr netcam){
 
     int      retcd;
     char     errstr[128];
-    uint8_t *buffer_out;
 
     retcd=my_image_fill_arrays(
         netcam->rtsp->swsframe_in
@@ -724,12 +768,13 @@ static int netcam_rtsp_resize(netcam_context_ptr netcam){
         return -1;
     }
 
-
-    buffer_out=(uint8_t *)av_malloc(netcam->rtsp->swsframe_size*sizeof(uint8_t));
+    /* XXX: could we use cnt->imgs.common_buffer instead? */
+    if (netcam->rtsp->resize_buffer == NULL)
+        netcam->rtsp->resize_buffer = (uint8_t *)av_malloc(netcam->rtsp->swsframe_size * sizeof(uint8_t));
 
     retcd=my_image_fill_arrays(
         netcam->rtsp->swsframe_out
-        ,buffer_out
+        ,netcam->rtsp->resize_buffer
         ,MY_PIX_FMT_YUV420P
         ,netcam->width
         ,netcam->height);
@@ -775,8 +820,6 @@ static int netcam_rtsp_resize(netcam_context_ptr netcam){
         return -1;
     }
     netcam->receiving->used = netcam->rtsp->swsframe_size;
-
-    av_free(buffer_out);
 
     return 0;
 
@@ -841,9 +884,10 @@ void netcam_shutdown_rtsp(netcam_context_ptr netcam){
 
     if (netcam->rtsp->status == RTSP_CONNECTED ||
         netcam->rtsp->status == RTSP_READINGIMAGE) {
-        netcam_rtsp_close_context(netcam);
         MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO,"%s: netcam shut down");
     }
+
+    netcam_rtsp_close_context(netcam);
 
     free(netcam->rtsp->path);
     free(netcam->rtsp->user);
@@ -880,6 +924,7 @@ int netcam_setup_rtsp(netcam_context_ptr netcam, struct url_t *url){
 
   struct context *cnt = netcam->cnt;
   const char *ptr;
+  char *path;
   int ret = -1;
 
   netcam->caps.streaming = NCS_RTSP;
@@ -900,8 +945,8 @@ int netcam_setup_rtsp(netcam_context_ptr netcam, struct url_t *url){
    */
 
   // force port to a sane value
-  if (netcam->connect_port > 65536) {
-    netcam->connect_port = 65536;
+  if (netcam->connect_port > 65535) {
+    netcam->connect_port = 65535;
   } else if (netcam->connect_port < 0) {
     netcam->connect_port = 0;
   }
@@ -928,22 +973,22 @@ int netcam_setup_rtsp(netcam_context_ptr netcam, struct url_t *url){
      *  determine the authentication type
      */
     if (strcmp(url->service, "v4l2") == 0) {
-        ptr = mymalloc(strlen(url->path));
-        sprintf((char *)ptr, "%s",url->path);
+        path = mymalloc(strlen(url->path));
+        sprintf(path, "%s", url->path);
     } else if ((netcam->rtsp->user != NULL) && (netcam->rtsp->pass != NULL)) {
-        ptr = mymalloc(strlen(url->service) + strlen(netcam->connect_host)
+        path = mymalloc(strlen(url->service) + strlen(netcam->connect_host)
               + 5 + strlen(url->path) + 5
               + strlen(netcam->rtsp->user) + strlen(netcam->rtsp->pass) + 4 );
-        sprintf((char *)ptr, "%s://%s:%s@%s:%d%s",
+        sprintf(path, "%s://%s:%s@%s:%d%s",
                 url->service,netcam->rtsp->user,netcam->rtsp->pass,
                 netcam->connect_host, netcam->connect_port, url->path);
     } else {
-        ptr = mymalloc(strlen(url->service) + strlen(netcam->connect_host)
+        path = mymalloc(strlen(url->service) + strlen(netcam->connect_host)
               + 5 + strlen(url->path) + 5);
-        sprintf((char *)ptr, "%s://%s:%d%s", url->service,
+        sprintf(path, "%s://%s:%d%s", url->service,
             netcam->connect_host, netcam->connect_port, url->path);
     }
-    netcam->rtsp->path = (char *)ptr;
+    netcam->rtsp->path = path;
 
     netcam_url_free(url);
 
@@ -1019,7 +1064,30 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
      * used to safely call other netcam functions. */
 
     pthread_mutex_lock(&netcam->mutex);
+
+    while (!netcam->get_picture) {
+        struct timespec waittime;
+        waittime.tv_sec  = time(NULL) + 2;
+        waittime.tv_nsec = 0;
+        if (pthread_cond_timedwait(&netcam->pic_ready, &netcam->mutex, &waittime) == 0)
+            break;
+        if (netcam->cnt->finish)
+            goto done;
+    }
+
+    netcam->get_picture = 0;
+
     memcpy(image, netcam->latest->ptr, netcam->latest->used);
+
+    /* Passthru HAAAACK */
+    assert(image == netcam->cnt->current_image->image);
+    assert(ffmpeg_packet_buffer_count(netcam->cnt->current_image->frame_pkts) == 0);
+    ffmpeg_packet_buffer_move(netcam->cnt->current_image->frame_pkts, netcam->latest->frame_pkts);
+    netcam->cnt->current_image->pts = netcam->latest->pts;
+    netcam->cnt->current_image->is_key_frame = netcam->latest->is_key_frame;
+
+    done:
+
     pthread_mutex_unlock(&netcam->mutex);
 
     if (netcam->cnt->rotate_data.degrees > 0)

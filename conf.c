@@ -24,10 +24,10 @@
  *      option should be configurable by the config file.
  */
 
+#include "motion.h"
+
 #include <dirent.h>
 #include <string.h>
-
-#include "motion.h"
 
 #define EXTENSION ".conf"
 
@@ -805,7 +805,8 @@ config_param config_params[] = {
     "# ogg - Ogg/Theora ( testing )\n"
     "# mp4 - MPEG-4 Part 14 H264 encoding\n"
     "# mkv - Matroska H264 encoding\n"
-    "# hevc - H.265 / HEVC (High Efficiency Video Coding)",
+    "# hevc - H.265 / HEVC (High Efficiency Video Coding)\n"
+    "# passthru - save in source format without re-encoding",
     0,
     CONF_OFFSET(ffmpeg_video_codec),
     copy_string,

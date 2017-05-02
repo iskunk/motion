@@ -15,6 +15,8 @@ set(sysconfdir "${CMAKE_INSTALL_PREFIX}/etc" CACHE STRING "system configuration 
 set(PACKAGE_NAME ${PROJECT_NAME} CACHE STRING "package name")
 set(PACKAGE_VERSION ${VERSION} CACHE STRING "package version")
 
+check_include_files(immintrin.h HAVE_IMMINTRIN_H)
+
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 find_package(JPEG REQUIRED)
@@ -60,7 +62,7 @@ set(HAVE_BKTR OFF)
   endif(CMAKE_SYSTEM_NAME MATCHES "NetBSD" OR CMAKE_SYSTEM_NAME MATCHES "OpenBSD")
 
 
-configure_file(config.h.in "${CMAKE_CURRENT_SOURCE_DIR}/config.h")
+configure_file(config-cmake.h.in config.h)
 configure_file(motion-dist.conf.in motion-dist.conf)
 configure_file(camera1-dist.conf.in camera1-dist.conf)
 configure_file(camera2-dist.conf.in camera2-dist.conf)
@@ -77,6 +79,7 @@ list(APPEND SRC_FILES
      netcam.c netcam_ftp.c netcam_jpeg.c netcam_rtsp.c netcam_wget.c
      picture.c rotate.c stream.c track.c video_loopback.c webhttpd.c
      video_v4l2.c video_common.c video_bktr.c)
+include_directories(${CMAKE_BINARY_DIR})
 include_directories(${JPEG_INCLUDE_DIR})
 list(APPEND LINK_LIBRARIES ${CMAKE_THREAD_LIBS_INIT} ${JPEG_LIBRARIES})
 
@@ -128,6 +131,9 @@ message("--   PGSQL:   " ${WITH_PGSQL}   " Include Dir: " ${PostgreSQL_INCLUDE_D
 message("--   FFMPEG:  " ${WITH_FFMPEG}  " Include Dir: " ${FFMPEG_INCLUDE_DIRS} )
 message("--   MMAL:    " ${WITH_MMAL} )
 message("--   CFLAGS:  " ${CMAKE_C_FLAGS} )
+
+# FIXME: not always needed for clock_gettime()
+list(APPEND LINK_LIBRARIES rt)
 
 add_executable(motion ${SRC_FILES})
 target_link_libraries(motion ${LINK_LIBRARIES})

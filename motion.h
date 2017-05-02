@@ -10,7 +10,7 @@
 #ifndef _INCLUDE_MOTION_H
 #define _INCLUDE_MOTION_H
 
-#include "config.h"
+#include <config.h>
 
 /* Includes */
 #ifdef HAVE_MYSQL
@@ -83,7 +83,7 @@
 #endif
 
 /* strerror_r() XSI vs GNU */
-#if (defined(BSD)) || ((_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && ! _GNU_SOURCE)
+#if (defined(BSD)) || ((_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && !defined(_GNU_SOURCE))
 #define XSI_STRERROR_R
 #endif
 
@@ -245,6 +245,9 @@ enum CAMERA_TYPE {
     CAMERA_TYPE_NETCAM
 };
 
+/* Forward declaration, defined in ffmpeg.c */
+struct packet_buff;
+
 struct image_data {
     unsigned char *image;
     int diffs;
@@ -257,11 +260,17 @@ struct image_data {
      */
     unsigned long cent_dist;
 
-    unsigned int flags;         /* Se IMAGE_* defines */
+    unsigned int flags;         /* See IMAGE_* defines */
 
     struct coord location;      /* coordinates for center and size of last motion detection*/
 
     int total_labels;
+
+#ifdef HAVE_FFMPEG
+    struct packet_buff *frame_pkts;
+    int64_t pts;
+    int is_key_frame;
+#endif
 };
 
 /*
@@ -460,6 +469,13 @@ struct context {
     struct ffmpeg *ffmpeg_smartmask;
     char timelapsefilename[PATH_MAX];
     char motionfilename[PATH_MAX];
+#ifdef HAVE_FFMPEG
+    void *rtsp_format_context;  /* actually an AVFormatContext */
+    int video_stream_index;
+    struct packet_buff *gap_pkts;
+    struct packet_buff *gop_pkts;
+    int64_t gop_start_pts;
+#endif
 
     int area_minx[9], area_miny[9], area_maxx[9], area_maxy[9];
     int areadetect_eventnbr;

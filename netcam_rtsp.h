@@ -20,6 +20,7 @@ struct rtsp_context {
     AVFrame*              swsframe_out;
     int                   swsframe_size;
     int                   video_stream_index;
+    int64_t               packet_serial;
     char*                 path;
     char*                 user;
     char*                 pass;
@@ -28,7 +29,8 @@ struct rtsp_context {
     int                   active;
     enum RTSP_STATUS      status;
     struct timeval        startreadtime;
-    struct SwsContext*   swsctx;
+    struct SwsContext*    swsctx;
+    uint8_t*              resize_buffer;
 };
 
 #else /* Do not have FFmpeg */

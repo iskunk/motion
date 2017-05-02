@@ -22,9 +22,8 @@
 */
 
 
-#include "config.h"
-#include "ffmpeg.h"
 #include "motion.h"
+#include "ffmpeg.h"
 
 #ifdef HAVE_FFMPEG
 
@@ -53,6 +52,7 @@
 #define MY_CODEC_ID_FLV1      AV_CODEC_ID_FLV1
 #define MY_CODEC_ID_FFV1      AV_CODEC_ID_FFV1
 #define MY_CODEC_ID_NONE      AV_CODEC_ID_NONE
+#define MY_CODEC_ID_MJPEG     AV_CODEC_ID_MJPEG
 #define MY_CODEC_ID_MPEG2VIDEO AV_CODEC_ID_MPEG2VIDEO
 #define MY_CODEC_ID_H264      AV_CODEC_ID_H264
 #define MY_CODEC_ID_HEVC      AV_CODEC_ID_HEVC
@@ -63,11 +63,18 @@
 #define MY_CODEC_ID_FLV1      CODEC_ID_FLV1
 #define MY_CODEC_ID_FFV1      CODEC_ID_FFV1
 #define MY_CODEC_ID_NONE      CODEC_ID_NONE
+#define MY_CODEC_ID_MJPEG     CODEC_ID_MJPEG
 #define MY_CODEC_ID_MPEG2VIDEO CODEC_ID_MPEG2VIDEO
 #define MY_CODEC_ID_H264      CODEC_ID_H264
 #define MY_CODEC_ID_HEVC      CODEC_ID_H264
 
 #endif
+
+struct packet_buff {
+    AVPacket *list;
+    int       count;
+    int       max;
+};
 
 /*********************************************/
 AVFrame *my_frame_alloc(void){
@@ -136,11 +143,12 @@ int my_image_fill_arrays(AVFrame *frame,uint8_t *buffer_ptr,enum MyPixelFormat p
     return retcd;
 }
 /*********************************************/
-void my_packet_unref(AVPacket pkt){
+void my_packet_unref(AVPacket *pkt){
 #if (LIBAVFORMAT_VERSION_MAJOR >= 57)
-    av_packet_unref(&pkt);
+    av_packet_unref(pkt);
 #else
-    av_free_packet(&pkt);
+    av_free_packet(pkt);
+    av_init_packet(pkt);
 #endif
 }
 /*********************************************/
@@ -340,7 +348,7 @@ static int ffmpeg_encode_video(struct ffmpeg *ffmpeg){
     retcd = avcodec_receive_packet(ffmpeg->ctx_codec, &ffmpeg->pkt);
     if (retcd == AVERROR(EAGAIN)){
         //Buffered packet.  Throw special return code
-        my_packet_unref(ffmpeg->pkt);
+        my_packet_unref(&ffmpeg->pkt);
         return -2;
     }
     if (retcd < 0 ){
@@ -369,7 +377,7 @@ static int ffmpeg_encode_video(struct ffmpeg *ffmpeg){
     }
     if (got_packet_ptr == 0){
         //Buffered packet.  Throw special return code
-        my_packet_unref(ffmpeg->pkt);
+        my_packet_unref(&ffmpeg->pkt);
         return -2;
     }
 
@@ -390,12 +398,12 @@ static int ffmpeg_encode_video(struct ffmpeg *ffmpeg){
     retcd = avcodec_encode_video(ffmpeg->video_st->codec, video_outbuf, video_outbuf_size, ffmpeg->picture);
     if (retcd < 0 ){
         MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Error encoding video");
-        my_packet_unref(ffmpeg->pkt);
+        my_packet_unref(&ffmpeg->pkt);
         return -1;
     }
     if (retcd == 0 ){
         // No bytes encoded => buffered=>special handling
-        my_packet_unref(ffmpeg->pkt);
+        my_packet_unref(&ffmpeg->pkt);
         return -2;
     }
 
@@ -501,7 +509,7 @@ static int ffmpeg_set_codec(struct ffmpeg *ffmpeg){
     }
     ffmpeg->ctx_codec = avcodec_alloc_context3(ffmpeg->codec);
     if (ffmpeg->ctx_codec == NULL) {
-        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Failed to allocate decoder!");
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Failed to allocate decoder!");
         ffmpeg_free_context(ffmpeg);
         return -1;
     }
@@ -716,7 +724,7 @@ static int ffmpeg_put_frame(struct ffmpeg *ffmpeg, const struct timeval *tv1){
     } else {
         retcd = av_write_frame(ffmpeg->oc, &ffmpeg->pkt);
     }
-    my_packet_unref(ffmpeg->pkt);
+    my_packet_unref(&ffmpeg->pkt);
 
     if (retcd < 0) {
         MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Error while writing video frame");
@@ -725,6 +733,89 @@ static int ffmpeg_put_frame(struct ffmpeg *ffmpeg, const struct timeval *tv1){
     }
     return retcd;
 
+}
+
+/* Create a new, empty packet buffer
+ */
+struct packet_buff *ffmpeg_packet_buffer_new(void) {
+    struct packet_buff *buffer = mymalloc(sizeof(struct packet_buff));
+    buffer->max = 8;
+    buffer->list = mymalloc(buffer->max * sizeof(AVPacket));
+    return buffer;
+}
+
+/* Add a packet to the buffer
+ * (note that the packet refcount is not incremented)
+ */
+void ffmpeg_packet_buffer_add(struct packet_buff *buffer, AVPacket *pkt) {
+    if (buffer->count == buffer->max) {
+        buffer->max *= 2;
+        buffer->list = myrealloc(buffer->list, buffer->max * sizeof(AVPacket), "ffmpeg_packet_buffer_add");
+    }
+
+    memcpy(&buffer->list[buffer->count++], pkt, sizeof(AVPacket));
+}
+
+/* Copy the packets in buffer 'src' into 'dest'
+ * (note that no packet refcounts are incremented)
+ */
+void ffmpeg_packet_buffer_copy(struct packet_buff *dest, struct packet_buff *src) {
+    int orig_max;
+
+    orig_max = dest->max;
+
+    assert(dest->max > 0);
+    while (dest->count + src->count > dest->max)
+        dest->max *= 2;
+
+    if (dest->max != orig_max)
+        dest->list = myrealloc(dest->list, dest->max * sizeof(AVPacket), "ffmpeg_packet_buffer_move");
+
+    memcpy(&dest->list[dest->count], src->list, src->count * sizeof(AVPacket));
+    dest->count += src->count;
+}
+
+/* Move the packets from buffer 'src' into 'dest'
+ * ('src' will be empty after this operation)
+ */
+void ffmpeg_packet_buffer_move(struct packet_buff *dest, struct packet_buff *src)
+{
+    ffmpeg_packet_buffer_copy(dest, src);
+    ffmpeg_packet_buffer_clear(src);
+}
+
+/* Clear the buffer of packets
+ * (buffer becomes empty but the packets are not unref'ed)
+ */
+void ffmpeg_packet_buffer_clear(struct packet_buff *buffer) {
+    /* memset(buffer->list, 0, buffer->count * sizeof(AVPacket)); */
+    buffer->count = 0;
+}
+
+/* Unref (free) and clear the packets in the buffer
+ * (buffer is empty after this operation)
+ */
+void ffmpeg_packet_buffer_unref(struct packet_buff *buffer) {
+    int i;
+    for (i = 0; i < buffer->count; i++)
+        my_packet_unref(&buffer->list[i]);
+
+    ffmpeg_packet_buffer_clear(buffer);
+}
+
+/* Return the number of packets in the buffer
+ */
+int ffmpeg_packet_buffer_count(struct packet_buff *buffer) {
+    return buffer->count;
+}
+
+/* Unref (free) any packets in the buffer, and free the buffer itself
+ */
+void ffmpeg_packet_buffer_free(struct packet_buff *buffer) {
+    ffmpeg_packet_buffer_unref(buffer);
+    if (buffer->list) free(buffer->list);
+    buffer->list = NULL;
+    free(buffer);
 }
 
 void ffmpeg_avcodec_log(void *ignoreme ATTRIBUTE_UNUSED, int errno_flag ATTRIBUTE_UNUSED, const char *fmt, va_list vl){
@@ -767,7 +858,7 @@ void ffmpeg_global_init(void){
     avcodec_register_all();
     avformat_network_init();
     avdevice_register_all();
-    av_log_set_callback((void *)ffmpeg_avcodec_log);
+    av_log_set_callback(ffmpeg_avcodec_log);
 
     ret = av_lockmgr_register(ffmpeg_lockmgr_cb);
     if (ret < 0)
@@ -787,12 +878,82 @@ void ffmpeg_global_deinit(void) {
 #ifdef HAVE_FFMPEG
 
     avformat_network_deinit();
+    av_lockmgr_register(NULL);
 
 #else /* No FFMPEG */
 
     MOTION_LOG(NTC, TYPE_ENCODER, NO_ERRNO,"%s: No ffmpeg functionality included");
 
 #endif /* HAVE_FFMPEG */
+}
+
+static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
+    int retcd;
+    int i;
+
+    switch (ffmpeg->passthru_codec_id) {
+        case MY_CODEC_ID_H264:
+        case MY_CODEC_ID_HEVC:
+        ffmpeg->codec_name = "mp4";
+        break;
+
+        case MY_CODEC_ID_MJPEG:
+        default:
+        ffmpeg->codec_name = "mkv";
+        break;
+    }
+
+    /* Make output timestamps start at zero, to avoid LONG pauses on the
+     * first frame (as well as any weirdness from negative timestamps)
+     */
+    ffmpeg->oc->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_ZERO;
+
+    retcd = ffmpeg_get_oformat(ffmpeg);
+    if (retcd < 0) {
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not get the output format!");
+        ffmpeg_free_context(ffmpeg);
+        return -1;
+    }
+
+    /* XXX: is this needed? */
+    ffmpeg->oc->oformat->video_codec = MY_CODEC_ID_NONE;
+
+    /*
+     * Following is cribbed from the FFmpeg remuxing.c example
+     */
+
+    for (i = 0; i < ffmpeg->rtsp_format_context->nb_streams; i++) {
+        AVStream *ist = ffmpeg->rtsp_format_context->streams[i];
+        AVStream *ost = avformat_new_stream(ffmpeg->oc, NULL);
+        if (!ost) {
+            MOTION_LOG(ERR, TYPE_STREAM, NO_ERRNO, "%s: Could not allocate output stream");
+            ffmpeg_free_context(ffmpeg);
+            return -1;
+        }
+
+        assert(ost->index == ist->index);
+
+        retcd = avcodec_parameters_copy(ost->codecpar, ist->codecpar);
+        if (retcd < 0) {
+            MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Failed to copy stream codec parameters");
+            ffmpeg_free_context(ffmpeg);
+            return -1;
+        }
+
+        ost->codecpar->codec_tag = 0;
+
+        /* XXX: is this needed? (probably) */
+        ost->time_base = ist->time_base;
+    }
+
+    retcd = ffmpeg_set_outputfile(ffmpeg);
+    if (retcd < 0) {
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the output file");
+        ffmpeg_free_context(ffmpeg);
+        return -1;
+    }
+
+    return 0;
 }
 
 int ffmpeg_open(struct ffmpeg *ffmpeg){
@@ -808,16 +969,18 @@ int ffmpeg_open(struct ffmpeg *ffmpeg){
         return -1;
     }
 
+    if (ffmpeg->rtsp_format_context) return ffmpeg_open_passthru(ffmpeg);
+
     retcd = ffmpeg_get_oformat(ffmpeg);
     if (retcd < 0 ) {
-        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Could not get codec!");
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not get the output format!");
         ffmpeg_free_context(ffmpeg);
         return -1;
     }
 
     retcd = ffmpeg_set_codec(ffmpeg);
     if (retcd < 0 ) {
-        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Failed to allocate codec!");
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the codec");
         return -1;
     }
 
@@ -829,13 +992,13 @@ int ffmpeg_open(struct ffmpeg *ffmpeg){
 
     retcd = ffmpeg_set_picture(ffmpeg);
     if (retcd < 0){
-        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the stream");
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the picture");
         return -1;
     }
 
     retcd = ffmpeg_set_outputfile(ffmpeg);
     if (retcd < 0){
-        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the stream");
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the output file");
         return -1;
     }
 
@@ -927,3 +1090,87 @@ int ffmpeg_put_image(struct ffmpeg *ffmpeg, unsigned char *image, const struct t
 #endif // HAVE_FFMPEG
 }
 
+int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer) {
+#ifdef HAVE_FFMPEG
+    int retcd = 0;
+    int i;
+
+    for (i = 0; i < buffer->count; i++) {
+        AVPacket *p = &buffer->list[i];
+        AVStream *ost = ffmpeg->oc->streams[p->stream_index];
+        AVPacket p_copy;
+#if 1
+fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] OUT /\n",
+  p->stream_index,
+  p->pts,
+  p->pos,
+  p->flags & AV_PKT_FLAG_KEY ? 'I' : 'P');
+#endif
+
+#if 0 /* iskunk: can't do this check if netcam thread has exited */
+        {
+            /* Input and output streams have equal time bases, right?
+             */
+            AVStream *ist = ffmpeg->rtsp_format_context->streams[p->stream_index];
+            assert(!av_cmp_q(ost->time_base, ist->time_base));
+        }
+#endif /* 0 */
+
+        /*
+         * Remember that we are (ab)using the packet's .pos field to
+         * store a serial number (see netcam_read_rtsp_image()) and are
+         * keeping track of the serial number of the last packet written
+         * out to the movie file. Using those, the following two
+         * assertions should be a pretty bulletproof check that we're
+         * writing out packets in the correct sequence.
+         */
+
+        /* If this is the first packet in a sequence, then it
+         * had better correspond to a keyframe
+         */
+        assert(ffmpeg->passthru_last_serial >= 0 ||
+               p->flags & AV_PKT_FLAG_KEY);
+
+        /* If this is NOT the first packet in a sequence, then
+         * it had better be the successor of the previous one
+         */
+        assert(ffmpeg->passthru_last_serial < 0 ||
+               p->pos == ffmpeg->passthru_last_serial + 1);
+
+        ffmpeg->passthru_last_serial = p->pos;
+
+        /* av_interleaved_write_frame() frees the packet that it writes,
+         * and we don't want that, because we might end up needing to
+         * write out the same packet again later. So we make a copy.
+         */
+        av_init_packet(&p_copy);
+        av_packet_ref(&p_copy, p);
+
+        if (ffmpeg->passthru_ts_offset != 0) {
+            /*
+             * Adjust the packet timestamps to account for continuity gaps
+             *
+             * (Note that this is similar to what FFmpeg does with
+             * AVFormatContext.output_ts_offset, but we can't use that
+             * feature because the offset is applied _after_ checking
+             * that the timestamps are monotonically increasing)
+             */
+            int64_t offset = av_rescale_q(ffmpeg->passthru_ts_offset, AV_TIME_BASE_Q, ost->time_base);
+            p_copy.dts += offset;
+            p_copy.pts += offset;
+        }
+
+        p_copy.pos = -1;  /* output byte position is not (yet) known */
+
+        retcd = av_interleaved_write_frame(ffmpeg->oc, &p_copy);
+        if (retcd < 0) break;
+    }
+
+    return retcd;
+#else
+    if (ffmpeg && buffer) {
+        MOTION_LOG(DBG, TYPE_ENCODER, NO_ERRNO, "%s: No ffmpeg support");
+    }
+    return 0;
+#endif
+}

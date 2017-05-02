@@ -980,6 +980,7 @@ static void v4l2_set_input(struct context *cnt, struct video_dev *viddev, unsign
         freq != viddev->freq || tuner_number != viddev->tuner_number || norm != viddev->norm) {
 
         unsigned int i;
+        struct timespec switchTimeRaw;
         struct timeval switchTime;
         unsigned int skip = conf->roundrobin_skip;
 
@@ -989,7 +990,13 @@ static void v4l2_set_input(struct context *cnt, struct video_dev *viddev, unsign
         v4l2_select_input(conf, viddev, (src_v4l2_t *) viddev->v4l2_private,
                           input, norm, freq, tuner_number);
 
-        gettimeofday(&switchTime, NULL);
+#ifndef CLOCK_MONOTONIC_RAW
+# define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
+#endif
+
+        clock_gettime(CLOCK_MONOTONIC_RAW, &switchTimeRaw);
+        switchTime.tv_sec  = switchTimeRaw.tv_sec;
+        switchTime.tv_usec = switchTimeRaw.tv_nsec / 1000;
 
         v4l2_picture_controls(cnt, viddev);
 

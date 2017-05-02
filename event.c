@@ -8,8 +8,8 @@
     see also the file 'COPYING'.
 */
 
-#include "ffmpeg.h"    /* must be first to avoid 'shadow' warning */
 #include "picture.h"   /* already includes motion.h */
+#include "ffmpeg.h"
 #include "event.h"
 #include "video_loopback.h"
 #include "video_common.h"
@@ -373,9 +373,12 @@ const char *imageext(struct context *cnt)
 
 static void event_image_detect(struct context *cnt,
         motion_event type ATTRIBUTE_UNUSED,
-        unsigned char *newimg, char *dummy1 ATTRIBUTE_UNUSED,
-        void *dummy2 ATTRIBUTE_UNUSED, struct timeval *currenttime_tv)
+        unsigned char *dummy0 ATTRIBUTE_UNUSED,
+        char *dummy1 ATTRIBUTE_UNUSED,
+        void *imgdata_ptr, struct timeval *currenttime_tv)
 {
+    struct image_data *imgdata = (struct image_data *)imgdata_ptr;
+    unsigned char *newimg = imgdata->image;
     char fullfilename[PATH_MAX];
     char filename[PATH_MAX];
 
@@ -597,9 +600,13 @@ static void event_create_extpipe(struct context *cnt,
 
 static void event_extpipe_put(struct context *cnt,
             motion_event type ATTRIBUTE_UNUSED,
-            unsigned char *img, char *dummy1 ATTRIBUTE_UNUSED,
-            void *dummy2 ATTRIBUTE_UNUSED, struct timeval *tv1 ATTRIBUTE_UNUSED)
+            unsigned char *dummy0 ATTRIBUTE_UNUSED,
+            char *dummy1 ATTRIBUTE_UNUSED,
+            void *imgdata_ptr, struct timeval *tv1 ATTRIBUTE_UNUSED)
 {
+    struct image_data *imgdata = (struct image_data *)imgdata_ptr;
+    unsigned char *img = imgdata->image;
+
     /* Check use_extpipe enabled and ext_pipe not NULL */
     if ((cnt->conf.useextpipe) && (cnt->extpipe != NULL)) {
         MOTION_LOG(DBG, TYPE_EVENTS, NO_ERRNO, "%s:");
@@ -741,6 +748,20 @@ static void event_ffmpeg_newfile(struct context *cnt,
             cnt->ffmpeg_output->test_mode = 0;
         }
 
+        if (!strcmp(codec, "passthru")) {
+            AVStream *st;
+            /*
+             * XXX: lock needed here? (note that our access to
+             * rtsp_format_context is read-only and we only need
+             * it to be valid during movie setup)
+             */
+            cnt->ffmpeg_output->rtsp_format_context = (AVFormatContext *)cnt->rtsp_format_context;
+            st = cnt->ffmpeg_output->rtsp_format_context->streams[cnt->video_stream_index];
+            cnt->ffmpeg_output->passthru_codec_id = st->codecpar->codec_id;
+            cnt->ffmpeg_output->passthru_time_base = st->time_base;
+            cnt->ffmpeg_output->passthru_last_serial = -1;
+        }
+
         retcd = ffmpeg_open(cnt->ffmpeg_output);
         if (retcd < 0){
             MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: ffopen_open error creating (new) file [%s]",cnt->newfilename);
@@ -860,11 +881,112 @@ static void event_ffmpeg_timelapse(struct context *cnt,
 
 static void event_ffmpeg_put(struct context *cnt,
             motion_event type ATTRIBUTE_UNUSED,
-            unsigned char *img, char *dummy1 ATTRIBUTE_UNUSED,
-            void *dummy2 ATTRIBUTE_UNUSED, struct timeval *currenttime_tv)
+            unsigned char *dummy0 ATTRIBUTE_UNUSED,
+            char *dummy1 ATTRIBUTE_UNUSED,
+            void *imgdata_ptr, struct timeval *currenttime_tv)
 {
+    struct image_data *imgdata = (struct image_data *)imgdata_ptr;
+    unsigned char *img = imgdata->image;
+
     if (cnt->ffmpeg_output) {
-        if (ffmpeg_put_image(cnt->ffmpeg_output, img, currenttime_tv) == -1) {
+        if (cnt->ffmpeg_output->rtsp_format_context) {
+            /*
+             * Passthru mode
+             */
+            int write_frame = 1;
+            if (!cnt->ffmpeg_output->passthru_started) {
+                /*
+                 * Starting a new passthru sequence; next frame written
+                 * out MUST be a key frame
+                 */
+                int64_t start_pts = -1;
+                int write_gap = 0;
+                int write_gop = 0;
+                if (imgdata->pts < cnt->ffmpeg_output->last_pts) {
+                    /*
+                     * Uh-oh. Did the netcam thread re-start the stream
+                     * on us? Wipe the slate clean to avoid trouble
+                     */
+                    ffmpeg_packet_buffer_clear(cnt->gap_pkts);
+                    ffmpeg_packet_buffer_clear(cnt->gop_pkts);
+                    cnt->ffmpeg_output->last_pts = 0;
+                }
+                if (imgdata->is_key_frame) {
+                    /*
+                     * Either we lucked out and just happened to start
+                     * on a key frame, or we've been dropping frames due
+                     * to a missing key frame and our bad luck has ended
+                     */
+fprintf(stderr, "event_ffmpeg_put: starting new sequence (key frame)\n");
+                    if (cnt->ffmpeg_output->passthru_frames_lost > 0) {
+                        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO, "%s: Dropped %d frame(s) from passthru movie due to missing GOP filler", cnt->ffmpeg_output->passthru_frames_lost);
+                        cnt->ffmpeg_output->passthru_frames_lost = 0;
+                    }
+                    start_pts = imgdata->pts;
+                    cnt->ffmpeg_output->passthru_last_serial = -1;
+                } else if (ffmpeg_packet_buffer_count(cnt->gap_pkts) > 0 &&
+                           cnt->gop_start_pts <= cnt->ffmpeg_output->last_pts) {
+                    /*
+                     * Not a key frame, but apparently we're still in the
+                     * same GOP as the end of the last sequence. Rather
+                     * than re-start the GOP (which would show as an ugly
+                     * jump back in time in the video), we complete it so
+                     * the video shows no gap whatsoever
+                     */
+fprintf(stderr, "event_ffmpeg_put: continuing last sequence\n");
+                    write_gap = 1;
+                } else if (ffmpeg_packet_buffer_count(cnt->gop_pkts) > 0) {
+                    /*
+                     * Not a key frame, but we have all the preceding
+                     * frames from its containing GOP
+                     */
+fprintf(stderr, "event_ffmpeg_put: starting new sequence (GOP fill)\n");
+                    start_pts = cnt->gop_start_pts;
+                    write_gop = 1;
+                    cnt->ffmpeg_output->passthru_last_serial = -1;
+                } else {
+                    /*
+                     * Oh, crud... we have to drop this frame, because
+                     * it's not a key frame and we don't have the
+                     * prior frames necessary for it to show correctly
+                     */
+                    write_frame = 0;
+                }
+                /* Now, if this is not the first sequence in the file,
+                 * then we need to calculate the length of the gap between
+                 * the end of the previous sequence and the start of this
+                 * one. This will then be used to adjust a timestamp
+                 * offset that is applied to subsequent output, because
+                 * time discontinuities in the video cannot be reflected
+                 * in the packet timestamps (unless you like long pauses)
+                 *
+                 * Note that in some instances, the gap can be negative!
+                 */
+                if (start_pts >= 0 && cnt->ffmpeg_output->last_pts > 0) {
+                    int64_t gap_pts  = start_pts - cnt->ffmpeg_output->last_pts;
+                    int64_t gap_usec = av_rescale_q(gap_pts, cnt->ffmpeg_output->passthru_time_base, AV_TIME_BASE_Q);
+                    cnt->ffmpeg_output->passthru_ts_offset -= gap_usec;
+                    /* Don't overstep last frame of previous sequence */
+                    cnt->ffmpeg_output->passthru_ts_offset += 2 * AV_TIME_BASE / cnt->ffmpeg_output->fps;
+                }
+                if (write_gap && ffmpeg_put_packets(cnt->ffmpeg_output, cnt->gap_pkts) < 0) {
+                    MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error writing out GOP filler packets");
+                }
+                if (write_gop && ffmpeg_put_packets(cnt->ffmpeg_output, cnt->gop_pkts) < 0) {
+                    MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error writing out GOP filler packets");
+                }
+                if (write_frame)
+                    cnt->ffmpeg_output->passthru_started = 1;
+                else
+                    cnt->ffmpeg_output->passthru_frames_lost++;
+            }
+            if (write_frame) {
+                if (ffmpeg_put_packets(cnt->ffmpeg_output, imgdata->frame_pkts) < 0) {
+                    MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error writing out frame packet(s)");
+                }
+                cnt->ffmpeg_output->last_pts = imgdata->pts;
+            }
+        } else if (ffmpeg_put_image(cnt->ffmpeg_output, img, currenttime_tv) == -1) {
             MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error encoding image");
         }
     }

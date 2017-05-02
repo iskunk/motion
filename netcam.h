@@ -92,6 +92,11 @@ typedef struct netcam_image_buff {
     size_t size;                    /* total allocated size */
     size_t used;                    /* bytes already used */
     struct timeval image_time;      /* time this image was received */
+#ifdef HAVE_FFMPEG
+    struct packet_buff *frame_pkts;
+    int64_t pts;
+    int is_key_frame;
+#endif
 } netcam_buff;
 typedef netcam_buff *netcam_buff_ptr;
 
@@ -156,6 +161,8 @@ typedef struct netcam_context {
                                    a new cycle as soon as possible,
                                    even if it's not currently waiting
                                    on the condition. */
+
+    int get_picture;            /* flag to likewise supplement pic_ready */
 
     char *connect_host;         /* the host to connect to (may be
                                    either the camera host, or

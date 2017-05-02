@@ -38,6 +38,7 @@
  *      motion.
  */
 #include "motion.h"
+#include "ffmpeg.h"
 
 #include <netdb.h>
 #include <netinet/in.h>
@@ -1076,11 +1077,17 @@ void netcam_image_read_complete(netcam_context_ptr netcam)
     netcam->receiving = xchg;
     netcam->imgcnt++;
 
+#ifdef HAVE_FFMPEG
+    ffmpeg_packet_buffer_unref(netcam->receiving->frame_pkts);
+    netcam->receiving->is_key_frame = 0;
+#endif
+
     /*
      * We have a new frame ready.  We send a signal so that
      * any thread (e.g. the motion main loop) waiting for the
      * next frame to become available may proceed.
      */
+    netcam->get_picture = 1;
     pthread_cond_signal(&netcam->pic_ready);
     pthread_mutex_unlock(&netcam->mutex);
 }
@@ -1922,14 +1929,9 @@ static void *netcam_handler_loop(void *arg)
          * If non-streaming, want to synchronize our thread with the
          * motion main-loop.
          */
-        if (netcam->caps.streaming == NCS_UNSUPPORTED) {
+        if (netcam->caps.streaming == NCS_UNSUPPORTED
+/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP) {
             pthread_mutex_lock(&netcam->mutex);
-
-            /* Before anything else, check for system shutdown. */
-            if (netcam->finish) {
-                pthread_mutex_unlock(&netcam->mutex);
-                break;
-            }
 
             /*
              * If our current loop has finished before the next
@@ -1939,8 +1941,13 @@ static void *netcam_handler_loop(void *arg)
              * us, we just continue.  In either event, we clear
              * the start_capture flag set by the main loop.
              */
-            if (!netcam->start_capture)
-                pthread_cond_wait(&netcam->cap_cond, &netcam->mutex);
+            while (!netcam->start_capture && !netcam->finish) {
+                struct timespec waittime;
+                waittime.tv_sec  = time(NULL) + 2;
+                waittime.tv_nsec = 0;
+                if (pthread_cond_timedwait(&netcam->cap_cond, &netcam->mutex, &waittime) == 0)
+                    break;
+            }
 
             netcam->start_capture = 0;
 
@@ -2381,8 +2388,10 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
      */
     pthread_mutex_lock(&netcam->mutex);
 
-    if (netcam->cnt->netcam == NULL)
+    if (netcam->cnt->netcam == NULL) {
+        pthread_mutex_unlock(&netcam->mutex);
         return;
+    }
 
     /*
      * We set the netcam_context pointer in the motion main-loop context
@@ -2403,7 +2412,8 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
      * netcam->mutex locked.
      */
 
-    if (netcam->caps.streaming == NCS_UNSUPPORTED)
+    if (netcam->caps.streaming == NCS_UNSUPPORTED
+/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP)
         pthread_cond_signal(&netcam->cap_cond);
 
 
@@ -2452,11 +2462,17 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
 
     if (netcam->latest != NULL) {
         free(netcam->latest->ptr);
+#ifdef HAVE_FFMPEG
+        ffmpeg_packet_buffer_free(netcam->latest->frame_pkts);
+#endif
         free(netcam->latest);
     }
 
     if (netcam->receiving != NULL) {
         free(netcam->receiving->ptr);
+#ifdef HAVE_FFMPEG
+        ffmpeg_packet_buffer_free(netcam->receiving->frame_pkts);
+#endif
         free(netcam->receiving);
     }
 
@@ -2520,7 +2536,8 @@ int netcam_next(struct context *cnt, unsigned char *image)
      * motion main-loop with the camera-handling thread through a signal,
      * together with a flag to say "start your next capture".
      */
-    if (netcam->caps.streaming == NCS_UNSUPPORTED) {
+    if (netcam->caps.streaming == NCS_UNSUPPORTED
+/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP) {
         pthread_mutex_lock(&netcam->mutex);
         netcam->start_capture = 1;
         pthread_cond_signal(&netcam->cap_cond);
@@ -2603,6 +2620,11 @@ int netcam_start(struct context *cnt)
     netcam->latest = mymalloc(sizeof(netcam_buff));
     netcam->latest->ptr = mymalloc(NETCAM_BUFFSIZE);
     netcam->timeout.tv_sec = READ_TIMEOUT;
+
+#ifdef HAVE_FFMPEG
+    netcam->receiving->frame_pkts = ffmpeg_packet_buffer_new();
+    netcam->latest->frame_pkts    = ffmpeg_packet_buffer_new();
+#endif
 
     /* Thread control structures */
     pthread_mutex_init(&netcam->mutex, NULL);

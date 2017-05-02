@@ -5,7 +5,6 @@
 #include <stdarg.h>
 #include <sys/time.h>
 #include <stdint.h>
-#include "config.h"
 
 enum TIMELAPSE_TYPE {
     TIMELAPSE_NONE,         /* No timelapse, regular processing */
@@ -42,6 +41,9 @@ struct ffmpeg {
     AVPacket pkt;
     AVFrame *picture;       /* contains default image pointers */
     AVDictionary *opts;
+    AVFormatContext *rtsp_format_context;
+    enum AVCodecID passthru_codec_id;
+    AVRational passthru_time_base;
 #endif
     int width;
     int height;
@@ -55,6 +57,10 @@ struct ffmpeg {
     int test_mode;
     int gop_cnt;
     struct timeval start_time;
+    int passthru_started;
+    int passthru_frames_lost;
+    int64_t passthru_ts_offset;
+    int64_t passthru_last_serial;
 };
 
 
@@ -62,11 +68,20 @@ struct ffmpeg {
 
 AVFrame *my_frame_alloc(void);
 void my_frame_free(AVFrame *frame);
-void my_packet_unref(AVPacket pkt);
+void my_packet_unref(AVPacket *pkt);
 void my_avcodec_close(AVCodecContext *codec_context);
 int my_image_get_buffer_size(enum MyPixelFormat pix_fmt, int width, int height);
 int my_image_copy_to_buffer(AVFrame *frame,uint8_t *buffer_ptr,enum MyPixelFormat pix_fmt,int width,int height,int dest_size);
 int my_image_fill_arrays(AVFrame *frame,uint8_t *buffer_ptr,enum MyPixelFormat pix_fmt,int width,int height);
+
+struct packet_buff *ffmpeg_packet_buffer_new(void);
+void ffmpeg_packet_buffer_add(struct packet_buff *buffer, AVPacket *pkt);
+void ffmpeg_packet_buffer_copy(struct packet_buff *dest, struct packet_buff *src);
+void ffmpeg_packet_buffer_move(struct packet_buff *dest, struct packet_buff *src);
+void ffmpeg_packet_buffer_clear(struct packet_buff *buffer);
+void ffmpeg_packet_buffer_unref(struct packet_buff *buffer);
+int  ffmpeg_packet_buffer_count(struct packet_buff *buffer);
+void ffmpeg_packet_buffer_free(struct packet_buff *buffer);
 
 #endif /* HAVE_FFMPEG */
 
@@ -76,6 +91,7 @@ void ffmpeg_avcodec_log(void *, int, const char *, va_list);
 
 int ffmpeg_open(struct ffmpeg *ffmpeg);
 int ffmpeg_put_image(struct ffmpeg *ffmpeg, unsigned char *image, const struct timeval *tv1);
+int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer);
 void ffmpeg_close(struct ffmpeg *ffmpeg);
 
 #endif /* _INCLUDE_FFMPEG_H_ */

@@ -1,7 +1,6 @@
 # Process this file with autoconf to produce a configure script
 
 AC_INIT(motion, esyscmd(['./version.sh']))
-AC_GNU_SOURCE
 AC_CONFIG_SRCDIR([motion.c])
 AC_CONFIG_HEADERS(config.h)
 AC_PROG_CC
@@ -350,7 +349,7 @@ else
 fi
 AC_SUBST(BIN_PATH)
 
-AC_CHECK_HEADERS(stdio.h unistd.h stdint.h fcntl.h time.h signal.h sys/ioctl.h sys/mman.h sys/param.h sys/types.h)
+AC_CHECK_HEADERS(stdio.h unistd.h stdint.h fcntl.h time.h signal.h sys/ioctl.h sys/mman.h sys/param.h sys/types.h immintrin.h)
 
 AC_CONFIG_FILES([
 camera1-dist.conf
