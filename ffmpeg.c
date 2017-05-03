@@ -71,7 +71,7 @@
 #endif
 
 struct packet_buff {
-    AVPacket *list;
+    AVPacket *array;
     int       count;
     int       max;
 };
@@ -740,7 +740,7 @@ static int ffmpeg_put_frame(struct ffmpeg *ffmpeg, const struct timeval *tv1){
 struct packet_buff *ffmpeg_packet_buffer_new(void) {
     struct packet_buff *buffer = mymalloc(sizeof(struct packet_buff));
     buffer->max = 8;
-    buffer->list = mymalloc(buffer->max * sizeof(AVPacket));
+    buffer->array = mymalloc(buffer->max * sizeof(*buffer->array));
     return buffer;
 }
 
@@ -750,10 +750,10 @@ struct packet_buff *ffmpeg_packet_buffer_new(void) {
 void ffmpeg_packet_buffer_add(struct packet_buff *buffer, AVPacket *pkt) {
     if (buffer->count == buffer->max) {
         buffer->max *= 2;
-        buffer->list = myrealloc(buffer->list, buffer->max * sizeof(AVPacket), "ffmpeg_packet_buffer_add");
+        buffer->array = myrealloc(buffer->array, buffer->max * sizeof(*buffer->array), "ffmpeg_packet_buffer_add");
     }
 
-    memcpy(&buffer->list[buffer->count++], pkt, sizeof(AVPacket));
+    memcpy(&buffer->array[buffer->count++], pkt, sizeof(*buffer->array));
 }
 
 /* Copy the packets in buffer 'src' into 'dest'
@@ -769,9 +769,9 @@ void ffmpeg_packet_buffer_copy(struct packet_buff *dest, struct packet_buff *src
         dest->max *= 2;
 
     if (dest->max != orig_max)
-        dest->list = myrealloc(dest->list, dest->max * sizeof(AVPacket), "ffmpeg_packet_buffer_move");
+        dest->array = myrealloc(dest->array, dest->max * sizeof(*dest->array), "ffmpeg_packet_buffer_copy");
 
-    memcpy(&dest->list[dest->count], src->list, src->count * sizeof(AVPacket));
+    memcpy(&dest->array[dest->count], src->array, src->count * sizeof(*dest->array));
     dest->count += src->count;
 }
 
@@ -788,7 +788,7 @@ void ffmpeg_packet_buffer_move(struct packet_buff *dest, struct packet_buff *src
  * (buffer becomes empty but the packets are not unref'ed)
  */
 void ffmpeg_packet_buffer_clear(struct packet_buff *buffer) {
-    /* memset(buffer->list, 0, buffer->count * sizeof(AVPacket)); */
+    /* memset(buffer->array, 0, buffer->count * sizeof(*buffer->array)); */
     buffer->count = 0;
 }
 
@@ -798,7 +798,7 @@ void ffmpeg_packet_buffer_clear(struct packet_buff *buffer) {
 void ffmpeg_packet_buffer_unref(struct packet_buff *buffer) {
     int i;
     for (i = 0; i < buffer->count; i++)
-        my_packet_unref(&buffer->list[i]);
+        my_packet_unref(&buffer->array[i]);
 
     ffmpeg_packet_buffer_clear(buffer);
 }
@@ -813,8 +813,8 @@ int ffmpeg_packet_buffer_count(struct packet_buff *buffer) {
  */
 void ffmpeg_packet_buffer_free(struct packet_buff *buffer) {
     ffmpeg_packet_buffer_unref(buffer);
-    if (buffer->list) free(buffer->list);
-    buffer->list = NULL;
+    if (buffer->array) free(buffer->array);
+    buffer->array = NULL;
     free(buffer);
 }
 
@@ -1096,7 +1096,7 @@ int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer) {
     int i;
 
     for (i = 0; i < buffer->count; i++) {
-        AVPacket *p = &buffer->list[i];
+        AVPacket *p = &buffer->array[i];
         AVStream *ost = ffmpeg->oc->streams[p->stream_index];
         AVPacket p_copy;
 #if 1
