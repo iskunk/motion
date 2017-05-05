@@ -2531,6 +2531,11 @@ int netcam_next(struct context *cnt, unsigned char *image)
         return NETCAM_NOTHING_NEW_ERROR;
     }
 
+    if (netcam->caps.streaming == NCS_RTSP &&
+        netcam->rtsp->status == RTSP_RECONNECTING) {
+        return NETCAM_NOTHING_NEW_ERROR;
+    }
+
     /*
      * If we are controlling a non-streaming camera, we synchronize the
      * motion main-loop with the camera-handling thread through a signal,
@@ -2545,9 +2550,6 @@ int netcam_next(struct context *cnt, unsigned char *image)
     }
 
     if (netcam->caps.streaming == NCS_RTSP) {
-
-        if (netcam->rtsp->status == RTSP_RECONNECTING)
-            return NETCAM_NOTHING_NEW_ERROR;
 
         if (netcam_next_rtsp(image , netcam) < 0)
             return NETCAM_GENERAL_ERROR | NETCAM_JPEG_CONV_ERROR;

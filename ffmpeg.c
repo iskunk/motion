@@ -1163,6 +1163,9 @@ fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] OUT /\n",
         p_copy.pos = -1;  /* output byte position is not (yet) known */
 
         retcd = av_interleaved_write_frame(ffmpeg->oc, &p_copy);
+#if 1
+assert(retcd == 0); /* XXX: for validation only */
+#endif
         if (retcd < 0) break;
     }
 

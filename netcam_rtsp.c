@@ -118,9 +118,17 @@ static int rtsp_decode_video(AVPacket *packet, AVFrame *frame, AVCodecContext *c
 
 #else
 
+    AVPacket empty_packet;
     int retcd;
     int check = 0;
     char errstr[128];
+
+    if (!packet) {
+        av_init_packet(&empty_packet);
+        empty_packet.data = NULL;
+        empty_packet.size = 0;
+        packet = &empty_packet;
+    }
 
     retcd = avcodec_decode_video2(ctx_codec, frame, &check, packet);
     if (retcd < 0) {
@@ -386,6 +394,13 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
     size_decoded = rtsp_decode_packet(NULL, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
 
     while (size_decoded == 0 && av_read_frame(netcam->rtsp->format_context, &packet) >= 0) {
+
+        /* This seems to occur for the first packet received after
+         * reconnecting to a camera
+         */
+        if (packet.dts == AV_NOPTS_VALUE && packet.pts == AV_NOPTS_VALUE)
+            packet.dts = packet.pts = 0;
+
         if (packet.stream_index == netcam->rtsp->video_stream_index)
             size_decoded = rtsp_decode_packet(&packet, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
 
@@ -445,44 +460,53 @@ fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] IN  \\\n",
 */
 static int netcam_rtsp_resize_ntc(netcam_context_ptr netcam){
 
+    int diff_dims, diff_pixfmt;
+
     assert(netcam->rtsp->codec_context != NULL);
 
-    if ((netcam->width  != (unsigned)netcam->rtsp->codec_context->width) ||
-        (netcam->height != (unsigned)netcam->rtsp->codec_context->height) ||
-        (netcam_check_pixfmt(netcam) != 0) ){
+    diff_dims =
+        netcam->width  != (unsigned)netcam->rtsp->codec_context->width ||
+        netcam->height != (unsigned)netcam->rtsp->codec_context->height;
+
+    diff_pixfmt = netcam_check_pixfmt(netcam) != 0;
+
+    if (diff_dims || diff_pixfmt) {
         MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: ");
         MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: ****************************************************************");
         MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: The network camera is sending pictures in a different");
-        if ((netcam->width  != (unsigned)netcam->rtsp->codec_context->width) ||
-            (netcam->height != (unsigned)netcam->rtsp->codec_context->height)) {
-            if (netcam_check_pixfmt(netcam) != 0) {
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: size than specified in the config and also a ");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: different picture format.  The picture is being");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: transcoded to YUV420P and into the size requested");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: in the config file.  If possible change netcam to");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: be in YUV420P format and the size requested in the");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: config to possibly lower CPU usage.");
-            } else {
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: size than specified in the configuration file.");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: The picture is being transcoded into the size ");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: requested in the configuration.  If possible change");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: netcam or configuration to indicate the same size");
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: to possibly lower CPU usage.");
-            }
-            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Netcam: %d x %d => Config: %d x %d"
-            ,netcam->rtsp->codec_context->width,netcam->rtsp->codec_context->height
-            ,netcam->width,netcam->height);
+    }
+
+    if (diff_dims) {
+        if (diff_pixfmt) {
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: size than specified in the config and also a ");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: different picture format.  The picture is being");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: transcoded to YUV420P and into the size requested");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: in the config file.  If possible change netcam to");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: be in YUV420P format and the size requested in the");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: config to possibly lower CPU usage.");
         } else {
-            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: format than YUV420P.  The image sent is being ");
-            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: trancoded to YUV420P.  If possible change netcam ");
-            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: picture format to YUV420P to possibly lower CPU usage.");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: size than specified in the configuration file.");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: The picture is being transcoded into the size ");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: requested in the configuration.  If possible change");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: netcam or configuration to indicate the same size");
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: to possibly lower CPU usage.");
         }
+
+        MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Netcam: %d x %d => Config: %d x %d"
+        ,netcam->rtsp->codec_context->width,netcam->rtsp->codec_context->height
+        ,netcam->width,netcam->height);
+    } else if (diff_pixfmt) {
+        MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: format than YUV420P.  The image sent is being ");
+        MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: trancoded to YUV420P.  If possible change netcam ");
+        MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: picture format to YUV420P to possibly lower CPU usage.");
+    }
+
+    if (diff_dims || diff_pixfmt) {
         MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: ****************************************************************");
         MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: ");
     }
 
     return 0;
-
 }
 /**
 * netcam_rtsp_open_context
@@ -639,6 +663,7 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
 
     if (netcam_rtsp_open_sws(netcam) < 0) return -1;
 
+#if 0 /* XXX: don't do this or else we lose a frame */
     /*
      *  Validate that the previous steps opened the camera
      */
@@ -650,6 +675,7 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
         netcam_rtsp_close_context(netcam);
         return -1;
     }
+#endif /* 0 */
 
     netcam->rtsp->active = 1;
 
@@ -850,7 +876,9 @@ int netcam_connect_rtsp(netcam_context_ptr netcam){
 
     if (netcam_rtsp_resize_ntc(netcam) < 0 ) return -1;
 
+#if 0 /* XXX: don't do this or else we lose a frame */
     if (netcam_read_rtsp_image(netcam) < 0) return -1;
+#endif /* 0 */
 
     netcam->rtsp->status = RTSP_CONNECTED;
 

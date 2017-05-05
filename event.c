@@ -760,6 +760,8 @@ static void event_ffmpeg_newfile(struct context *cnt,
             cnt->ffmpeg_output->passthru_codec_id = st->codecpar->codec_id;
             cnt->ffmpeg_output->passthru_time_base = st->time_base;
             cnt->ffmpeg_output->passthru_last_serial = -1;
+
+            ffmpeg_packet_buffer_clear(cnt->gap_pkts);
         }
 
         retcd = ffmpeg_open(cnt->ffmpeg_output);
@@ -893,7 +895,12 @@ static void event_ffmpeg_put(struct context *cnt,
             /*
              * Passthru mode
              */
+            int stream_restarted = 0;
             int write_frame = 1;
+            if (imgdata->pts < cnt->ffmpeg_output->last_pts) {
+                stream_restarted = 1;
+                cnt->ffmpeg_output->passthru_started = 0;
+            }
             if (!cnt->ffmpeg_output->passthru_started) {
                 /*
                  * Starting a new passthru sequence; next frame written
@@ -902,15 +909,6 @@ static void event_ffmpeg_put(struct context *cnt,
                 int64_t start_pts = -1;
                 int write_gap = 0;
                 int write_gop = 0;
-                if (imgdata->pts < cnt->ffmpeg_output->last_pts) {
-                    /*
-                     * Uh-oh. Did the netcam thread re-start the stream
-                     * on us? Wipe the slate clean to avoid trouble
-                     */
-                    ffmpeg_packet_buffer_clear(cnt->gap_pkts);
-                    ffmpeg_packet_buffer_clear(cnt->gop_pkts);
-                    cnt->ffmpeg_output->last_pts = 0;
-                }
                 if (imgdata->is_key_frame) {
                     /*
                      * Either we lucked out and just happened to start
@@ -925,7 +923,8 @@ fprintf(stderr, "event_ffmpeg_put: starting new sequence (key frame)\n");
                     start_pts = imgdata->pts;
                     cnt->ffmpeg_output->passthru_last_serial = -1;
                 } else if (ffmpeg_packet_buffer_count(cnt->gap_pkts) > 0 &&
-                           cnt->gop_start_pts <= cnt->ffmpeg_output->last_pts) {
+                           cnt->gop_start_pts <= cnt->ffmpeg_output->last_pts &&
+                           !stream_restarted) {
                     /*
                      * Not a key frame, but apparently we're still in the
                      * same GOP as the end of the last sequence. Rather

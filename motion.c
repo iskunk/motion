@@ -2195,6 +2195,8 @@ static void mlp_actions(struct context *cnt){
                        cnt->postcap);
         } else {
             cnt->current_image->flags |= IMAGE_PRECAP;
+            if (cnt->ffmpeg_output)
+                cnt->ffmpeg_output->passthru_started = 0;
         }
 
         /* Always call motion_detected when we have a motion image */
