@@ -1079,6 +1079,7 @@ void netcam_image_read_complete(netcam_context_ptr netcam)
 
 #ifdef HAVE_FFMPEG
     ffmpeg_packet_buffer_unref(netcam->receiving->frame_pkts);
+    netcam->receiving->pts = AV_NOPTS_VALUE;
     netcam->receiving->is_key_frame = 0;
 #endif
 
@@ -1800,6 +1801,37 @@ static void *netcam_handler_loop(void *arg)
      */
 
     while (!netcam->finish) {
+
+#if 1
+        if (netcam->caps.streaming == NCS_UNSUPPORTED
+/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP) {
+            pthread_mutex_lock(&netcam->mutex);
+
+            /*
+             * If the motion main-loop has not requested a capture
+             * yet, then we do a conditional wait (wait for signal).
+             * On the other hand, if the motion main-loop has already
+             * signalled us, we just continue.  In either event, we
+             * clear the start_capture flag set by the main loop.
+             */
+            while (!netcam->start_capture && !netcam->finish) {
+                struct timespec waittime;
+                waittime.tv_sec  = time(NULL) + 2;
+                waittime.tv_nsec = 0;
+                if (pthread_cond_timedwait(&netcam->cap_cond, &netcam->mutex, &waittime) == 0)
+                    break;
+            }
+
+            netcam->start_capture = 0;
+
+            pthread_mutex_unlock(&netcam->mutex);
+
+            if (netcam->finish) break;
+        }
+#endif /* 1 */
+
+        restart:
+
         if (netcam->response) {    /* If html input */
             if (netcam->caps.streaming == NCS_UNSUPPORTED) {
                 /* Non-streaming ie. jpeg */
@@ -1823,7 +1855,7 @@ static void *netcam_handler_loop(void *arg)
                         }
                         /* Need to have a dynamic delay here. */
                         SLEEP(5, 0);
-                        continue;
+                        goto restart;
                     }
 
                     if (open_error) {          /* Log re-connection */
@@ -1842,7 +1874,7 @@ static void *netcam_handler_loop(void *arg)
                                    retval);
                     }
                     /* Need to have a dynamic delay here. */
-                    continue;
+                    goto restart;
                 }
             } else if (netcam->caps.streaming == NCS_MULTIPART) {    /* Multipart Streaming */
                 if (netcam_read_next_header(netcam) < 0) {
@@ -1853,7 +1885,7 @@ static void *netcam_handler_loop(void *arg)
                             open_error = 1;
                         }
                         SLEEP(5, 0);
-                        continue;
+                        goto restart;
                     }
 
                     if ((retval = netcam_read_first_header(netcam) != 2)) {
@@ -1866,7 +1898,7 @@ static void *netcam_handler_loop(void *arg)
                                        "%s: Error in header (%d)", retval);
                         }
                         /* FIXME need some limit. */
-                        continue;
+                        goto restart;
                     }
                 }
                 if (open_error) {          /* Log re-connection */
@@ -1882,6 +1914,7 @@ static void *netcam_handler_loop(void *arg)
             }
         }
 
+#ifdef HAVE_FFMPEG
         if (netcam->caps.streaming == NCS_RTSP) {
             if (!netcam->rtsp->active) {      // We must have disconnected.  Try to reconnect
                 if ((netcam->rtsp->status == RTSP_CONNECTED) ||
@@ -1890,7 +1923,7 @@ static void *netcam_handler_loop(void *arg)
                 }
                 netcam->rtsp->status = RTSP_RECONNECTING;
                 netcam_connect_rtsp(netcam);
-                continue;
+                goto restart;
             } else {
                 // We think we are connected...
                 if (netcam->get_image(netcam) < 0) {
@@ -1901,10 +1934,11 @@ static void *netcam_handler_loop(void *arg)
                     //Nope.  We are not or got bad image.  Reconnect
                     netcam->rtsp->status = RTSP_RECONNECTING;
                     netcam_connect_rtsp(netcam);
-                    continue;
+                    goto restart;
                 }
             }
         }
+#endif /* HAVE_FFMPEG */
 
         if (netcam->caps.streaming != NCS_RTSP) {
             if (netcam->get_image(netcam) < 0) {
@@ -1915,7 +1949,7 @@ static void *netcam_handler_loop(void *arg)
                     if (ftp_connect(netcam) < 0)
                         MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Trying to re-connect");
                 }
-                continue;
+                goto restart;
             }
         }
 
@@ -1929,6 +1963,7 @@ static void *netcam_handler_loop(void *arg)
          * If non-streaming, want to synchronize our thread with the
          * motion main-loop.
          */
+#if 0
         if (netcam->caps.streaming == NCS_UNSUPPORTED
 /* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP) {
             pthread_mutex_lock(&netcam->mutex);
@@ -1953,6 +1988,7 @@ static void *netcam_handler_loop(void *arg)
 
             pthread_mutex_unlock(&netcam->mutex);
         }
+#endif /* 0 */
     /* The loop continues forever, or until motion shutdown. */
     }
 
@@ -2531,10 +2567,12 @@ int netcam_next(struct context *cnt, unsigned char *image)
         return NETCAM_NOTHING_NEW_ERROR;
     }
 
+#ifdef HAVE_FFMPEG
     if (netcam->caps.streaming == NCS_RTSP &&
         netcam->rtsp->status == RTSP_RECONNECTING) {
         return NETCAM_NOTHING_NEW_ERROR;
     }
+#endif
 
     /*
      * If we are controlling a non-streaming camera, we synchronize the
@@ -2766,8 +2804,10 @@ int netcam_start(struct context *cnt)
     if ((retval = netcam->get_image(netcam)) != 0) {
         MOTION_LOG(CRT, TYPE_NETCAM, NO_ERRNO, "%s: Failed trying to "
                    "read first image - retval:%d", retval);
+#ifdef HAVE_FFMPEG
         if (netcam->caps.streaming == NCS_RTSP)
             netcam->rtsp->status = RTSP_NOTCONNECTED;
+#endif
         return -1;
     }
 

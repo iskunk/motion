@@ -748,6 +748,7 @@ static void event_ffmpeg_newfile(struct context *cnt,
             cnt->ffmpeg_output->test_mode = 0;
         }
 
+#ifdef HAVE_FFMPEG
         if (!strcmp(codec, "passthru")) {
             AVStream *st;
             /*
@@ -757,12 +758,17 @@ static void event_ffmpeg_newfile(struct context *cnt,
              */
             cnt->ffmpeg_output->rtsp_format_context = (AVFormatContext *)cnt->rtsp_format_context;
             st = cnt->ffmpeg_output->rtsp_format_context->streams[cnt->video_stream_index];
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
             cnt->ffmpeg_output->passthru_codec_id = st->codecpar->codec_id;
+#else
+            cnt->ffmpeg_output->passthru_codec_id = st->codec->codec_id;
+#endif
             cnt->ffmpeg_output->passthru_time_base = st->time_base;
             cnt->ffmpeg_output->passthru_last_serial = -1;
 
             ffmpeg_packet_buffer_clear(cnt->gap_pkts);
         }
+#endif /* HAVE_FFMPEG */
 
         retcd = ffmpeg_open(cnt->ffmpeg_output);
         if (retcd < 0){
@@ -891,6 +897,7 @@ static void event_ffmpeg_put(struct context *cnt,
     unsigned char *img = imgdata->image;
 
     if (cnt->ffmpeg_output) {
+#ifdef HAVE_FFMPEG
         if (cnt->ffmpeg_output->rtsp_format_context) {
             /*
              * Passthru mode
@@ -985,7 +992,9 @@ fprintf(stderr, "event_ffmpeg_put: starting new sequence (GOP fill)\n");
                 }
                 cnt->ffmpeg_output->last_pts = imgdata->pts;
             }
-        } else if (ffmpeg_put_image(cnt->ffmpeg_output, img, currenttime_tv) == -1) {
+        } else
+#endif /* HAVE_FFMPEG */
+        if (ffmpeg_put_image(cnt->ffmpeg_output, img, currenttime_tv) == -1) {
             MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error encoding image");
         }
     }

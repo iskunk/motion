@@ -53,6 +53,7 @@
 #define MY_CODEC_ID_FFV1      AV_CODEC_ID_FFV1
 #define MY_CODEC_ID_NONE      AV_CODEC_ID_NONE
 #define MY_CODEC_ID_MJPEG     AV_CODEC_ID_MJPEG
+#define MY_CODEC_ID_MPEG4     AV_CODEC_ID_MPEG4
 #define MY_CODEC_ID_MPEG2VIDEO AV_CODEC_ID_MPEG2VIDEO
 #define MY_CODEC_ID_H264      AV_CODEC_ID_H264
 #define MY_CODEC_ID_HEVC      AV_CODEC_ID_HEVC
@@ -64,6 +65,7 @@
 #define MY_CODEC_ID_FFV1      CODEC_ID_FFV1
 #define MY_CODEC_ID_NONE      CODEC_ID_NONE
 #define MY_CODEC_ID_MJPEG     CODEC_ID_MJPEG
+#define MY_CODEC_ID_MPEG4     CODEC_ID_MPEG4
 #define MY_CODEC_ID_MPEG2VIDEO CODEC_ID_MPEG2VIDEO
 #define MY_CODEC_ID_H264      CODEC_ID_H264
 #define MY_CODEC_ID_HEVC      CODEC_ID_H264
@@ -887,6 +889,7 @@ void ffmpeg_global_deinit(void) {
 #endif /* HAVE_FFMPEG */
 }
 
+#ifdef HAVE_FFMPEG
 static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
     int retcd;
     int i;
@@ -894,13 +897,23 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
     switch (ffmpeg->passthru_codec_id) {
         case MY_CODEC_ID_H264:
         case MY_CODEC_ID_HEVC:
+        case MY_CODEC_ID_MPEG4:
         ffmpeg->codec_name = "mp4";
         break;
 
         case MY_CODEC_ID_MJPEG:
         default:
-        ffmpeg->codec_name = "mkv";
+        ffmpeg->codec_name = "avi";
         break;
+
+        /*
+         * Note: "mkv" (Matroska) format is not supported for passthru
+         * recording as FFmpeg forces it to have a time base of 1/1000
+         * irrespective of whatever we specify (see mkv_init() in the
+         * FFmpeg source). We want the recorded movie file to accurately
+         * reflect what we got from the camera, and thereby prefer to
+         * avoid rescaling the packet timestamps.
+         */
     }
 
     /* Make output timestamps start at zero, to avoid LONG pauses on the
@@ -924,7 +937,11 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
 
     for (i = 0; i < ffmpeg->rtsp_format_context->nb_streams; i++) {
         AVStream *ist = ffmpeg->rtsp_format_context->streams[i];
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
         AVStream *ost = avformat_new_stream(ffmpeg->oc, NULL);
+#else
+        AVStream *ost = avformat_new_stream(ffmpeg->oc, ist->codec->codec);
+#endif
         if (!ost) {
             MOTION_LOG(ERR, TYPE_STREAM, NO_ERRNO, "%s: Could not allocate output stream");
             ffmpeg_free_context(ffmpeg);
@@ -933,17 +950,28 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
 
         assert(ost->index == ist->index);
 
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
         retcd = avcodec_parameters_copy(ost->codecpar, ist->codecpar);
+#else
+        retcd = avcodec_copy_context(ost->codec, ist->codec);
+#endif
         if (retcd < 0) {
             MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Failed to copy stream codec parameters");
             ffmpeg_free_context(ffmpeg);
             return -1;
         }
 
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
         ost->codecpar->codec_tag = 0;
+#else
+        ost->codec->codec_tag = 0;
 
-        /* XXX: is this needed? (probably) */
-        ost->time_base = ist->time_base;
+        if (ffmpeg->oc->oformat->flags & AVFMT_GLOBALHEADER)
+            ost->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+#endif
+
+        ost->disposition = ist->disposition;
+        ost->time_base   = ist->time_base;
     }
 
     retcd = ffmpeg_set_outputfile(ffmpeg);
@@ -953,8 +981,20 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
         return -1;
     }
 
+#ifndef NDEBUG
+    for (i = 0; i < ffmpeg->oc->nb_streams; i++) {
+        AVStream *ist = ffmpeg->rtsp_format_context->streams[i];
+        AVStream *ost = ffmpeg->oc->streams[i];
+
+        /* Input and output streams have equal time bases, right?
+         */
+        assert(!av_cmp_q(ist->time_base, ost->time_base));
+    }
+#endif /* !NDEBUG */
+
     return 0;
 }
+#endif /* HAVE_FFMPEG */
 
 int ffmpeg_open(struct ffmpeg *ffmpeg){
 
@@ -1106,15 +1146,6 @@ fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] OUT /\n",
   p->pos,
   p->flags & AV_PKT_FLAG_KEY ? 'I' : 'P');
 #endif
-
-#if 0 /* iskunk: can't do this check if netcam thread has exited */
-        {
-            /* Input and output streams have equal time bases, right?
-             */
-            AVStream *ist = ffmpeg->rtsp_format_context->streams[p->stream_index];
-            assert(!av_cmp_q(ost->time_base, ist->time_base));
-        }
-#endif /* 0 */
 
         /*
          * Remember that we are (ab)using the packet's .pos field to

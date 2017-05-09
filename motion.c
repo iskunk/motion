@@ -133,10 +133,9 @@ static void image_ring_resize(struct context *cnt, int new_size)
                     ffmpeg_packet_buffer_move(cnt->gop_pkts, tail->frame_pkts);
                 else
                     ffmpeg_packet_buffer_unref(tail->frame_pkts);
+                tail->pts = AV_NOPTS_VALUE;
                 tail->is_key_frame = 0;
             }
-
-
 }
 #endif
 
@@ -1593,7 +1592,9 @@ static void mlp_prepare(struct context *cnt){
 static void mlp_resetimages(struct context *cnt){
 
     struct image_data *old_image;
+#ifdef HAVE_FFMPEG
     int is_key, to_gap, to_gop;
+#endif
 
     if (cnt->conf.minimum_frame_time) {
         cnt->minimum_frame_time_downcounter = cnt->conf.minimum_frame_time;
@@ -1634,6 +1635,7 @@ static void mlp_resetimages(struct context *cnt){
         ffmpeg_packet_buffer_move(cnt->gop_pkts, cnt->current_image->frame_pkts);
     else
         ffmpeg_packet_buffer_unref(cnt->current_image->frame_pkts);
+    cnt->current_image->pts = AV_NOPTS_VALUE;
     cnt->current_image->is_key_frame = 0;
 #endif
 

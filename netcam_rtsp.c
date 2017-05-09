@@ -165,6 +165,13 @@ static int rtsp_decode_packet(AVPacket *packet, netcam_buff_ptr buffer, AVFrame 
     int frame_size;
     int retcd;
 
+    if (packet) {
+        if (buffer->pts == AV_NOPTS_VALUE)
+            buffer->pts = packet->pts;
+        if (packet->flags & AV_PKT_FLAG_KEY)
+            buffer->is_key_frame = 1;
+    }
+
     retcd = rtsp_decode_video(packet, frame, ctx_codec);
     if (retcd <= 0) return retcd;
 
@@ -179,10 +186,6 @@ static int rtsp_decode_packet(AVPacket *packet, netcam_buff_ptr buffer, AVFrame 
     }
 
     buffer->used = frame_size;
-
-    buffer->pts = packet ? packet->pts : -1;
-    if (packet && packet->flags & AV_PKT_FLAG_KEY)
-        buffer->is_key_frame = 1;
 
     return frame_size;
 }
@@ -377,6 +380,8 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
     buffer = netcam->receiving;
     buffer->used = 0;
 
+    assert(ffmpeg_packet_buffer_count(buffer->frame_pkts) == 0);
+
     av_init_packet(&packet);
     packet.data = NULL;
     packet.size = 0;
@@ -401,8 +406,15 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
         if (packet.dts == AV_NOPTS_VALUE && packet.pts == AV_NOPTS_VALUE)
             packet.dts = packet.pts = 0;
 
-        if (packet.stream_index == netcam->rtsp->video_stream_index)
+        if (packet.stream_index == netcam->rtsp->video_stream_index) {
             size_decoded = rtsp_decode_packet(&packet, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
+
+            /* If the packet is a "key" packet, then it must
+             * be first in the buffer
+             */
+            assert(!(packet.flags & AV_PKT_FLAG_KEY) ||
+                   ffmpeg_packet_buffer_count(buffer->frame_pkts) == 0);
+        }
 
         /* Re-purpose the .pos field to store a packet serial number
          */
@@ -648,6 +660,12 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
         netcam->rtsp->codec_context->height <= 0)
     {
         MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Camera image size is invalid");
+        netcam_rtsp_close_context(netcam);
+        return -1;
+    }
+
+    if (netcam->rtsp->codec_context->pix_fmt == AV_PIX_FMT_NONE) {
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Camera pixel format is undetermined");
         netcam_rtsp_close_context(netcam);
         return -1;
     }
@@ -1107,12 +1125,14 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
 
     memcpy(image, netcam->latest->ptr, netcam->latest->used);
 
+#ifdef HAVE_FFMPEG
     /* Passthru HAAAACK */
     assert(image == netcam->cnt->current_image->image);
     assert(ffmpeg_packet_buffer_count(netcam->cnt->current_image->frame_pkts) == 0);
     ffmpeg_packet_buffer_move(netcam->cnt->current_image->frame_pkts, netcam->latest->frame_pkts);
     netcam->cnt->current_image->pts = netcam->latest->pts;
     netcam->cnt->current_image->is_key_frame = netcam->latest->is_key_frame;
+#endif /* HAVE_FFMPEG */
 
     done:
 
