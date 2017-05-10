@@ -903,7 +903,7 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
 
         case MY_CODEC_ID_MJPEG:
         default:
-        ffmpeg->codec_name = "avi";
+        ffmpeg->codec_name = "mov";
         break;
 
         /*
@@ -928,7 +928,8 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
         return -1;
     }
 
-    /* XXX: is this needed? */
+    /* Reset whatever ffmpeg_get_oformat() set this to
+     */
     ffmpeg->oc->oformat->video_codec = MY_CODEC_ID_NONE;
 
     /*
@@ -970,8 +971,10 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
             ost->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 #endif
 
-        ost->disposition = ist->disposition;
-        ost->time_base   = ist->time_base;
+        ost->avg_frame_rate      = ist->avg_frame_rate;
+        ost->disposition         = ist->disposition;
+        ost->sample_aspect_ratio = ist->sample_aspect_ratio;
+        ost->time_base           = ist->time_base;
     }
 
     retcd = ffmpeg_set_outputfile(ffmpeg);

@@ -312,7 +312,7 @@ static int netcam_interrupt_rtsp(void *ctx){
 
     if (netcam->finish) {
         /* netcam_cleanup() wants us to stop */
-        rtsp->interrupted = 1;
+        if (rtsp) rtsp->interrupted = 1;
         return 1;
     }
 
