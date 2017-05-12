@@ -941,7 +941,8 @@ fprintf(stderr, "event_ffmpeg_put: starting new sequence (key frame)\n");
                      */
 fprintf(stderr, "event_ffmpeg_put: continuing last sequence\n");
                     write_gap = 1;
-                } else if (ffmpeg_packet_buffer_count(cnt->gop_pkts) > 0) {
+                } else if (ffmpeg_packet_buffer_count(cnt->gop_pkts) > 0 &&
+                           cnt->gop_start_pts < imgdata->pts) {
                     /*
                      * Not a key frame, but we have all the preceding
                      * frames from its containing GOP

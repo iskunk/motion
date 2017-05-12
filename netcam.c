@@ -1825,12 +1825,12 @@ static void *netcam_handler_loop(void *arg)
             netcam->start_capture = 0;
 
             pthread_mutex_unlock(&netcam->mutex);
-
-            if (netcam->finish) break;
         }
 #endif /* 1 */
 
         restart:
+
+        if (netcam->finish) break;
 
         if (netcam->response) {    /* If html input */
             if (netcam->caps.streaming == NCS_UNSUPPORTED) {

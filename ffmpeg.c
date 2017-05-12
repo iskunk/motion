@@ -1178,7 +1178,8 @@ fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] OUT /\n",
          * write out the same packet again later. So we make a copy.
          */
         av_init_packet(&p_copy);
-        av_packet_ref(&p_copy, p);
+        retcd = av_packet_ref(&p_copy, p);
+        if (retcd < 0) break;
 
         if (ffmpeg->passthru_ts_offset != 0) {
             /*

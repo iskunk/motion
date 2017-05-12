@@ -369,10 +369,11 @@ static int netcam_interrupt_rtsp(void *ctx){
 *
 */
 int netcam_read_rtsp_image(netcam_context_ptr netcam){
-    struct timeval    curtime;
+    struct timeval     curtime;
     netcam_buff_ptr    buffer;
     AVPacket           packet;
     int                size_decoded;
+    int                video_packet_count = 0;
 
     assert(netcam->rtsp->codec_context != NULL);
 
@@ -403,17 +404,22 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
         /* This seems to occur for the first packet received after
          * reconnecting to a camera
          */
-        if (packet.dts == AV_NOPTS_VALUE && packet.pts == AV_NOPTS_VALUE)
+        if (packet.dts == AV_NOPTS_VALUE && packet.pts == AV_NOPTS_VALUE) {
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Packet has invalid timestamps, setting to zero");
             packet.dts = packet.pts = 0;
+        }
 
         if (packet.stream_index == netcam->rtsp->video_stream_index) {
+            video_packet_count++;
             size_decoded = rtsp_decode_packet(&packet, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
 
-            /* If the packet is a "key" packet, then it must
-             * be first in the buffer
+            /* Rare weirdness
              */
-            assert(!(packet.flags & AV_PKT_FLAG_KEY) ||
-                   ffmpeg_packet_buffer_count(buffer->frame_pkts) == 0);
+            if (size_decoded > 0 && video_packet_count >= 2 &&
+                packet.flags & AV_PKT_FLAG_KEY) {
+                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Keyframe packet is required by preceding frame");
+                buffer->is_key_frame = 0;
+            }
         }
 
         /* Re-purpose the .pos field to store a packet serial number
@@ -897,6 +903,9 @@ int netcam_connect_rtsp(netcam_context_ptr netcam){
 #if 0 /* XXX: don't do this or else we lose a frame */
     if (netcam_read_rtsp_image(netcam) < 0) return -1;
 #endif /* 0 */
+
+    ffmpeg_packet_buffer_unref(netcam->latest->frame_pkts);
+    ffmpeg_packet_buffer_unref(netcam->receiving->frame_pkts);
 
     netcam->rtsp->status = RTSP_CONNECTED;
 

@@ -894,7 +894,7 @@ config_param config_params[] = {
     "text_right",
     "# Draws the timestamp using same options as C function strftime(3)\n"
     "# Default: %Y-%m-%d\\n%T = date in ISO format and time in 24 hour clock\n"
-    "# Text is placed in lower right corner",
+    "# Text is placed in lower right corner; set to empty value to disable",
     0,
     CONF_OFFSET(text_right),
     copy_string,
