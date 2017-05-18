@@ -119,26 +119,6 @@ static void image_ring_resize(struct context *cnt, int new_size)
             MOTION_LOG(NTC, TYPE_ALL, NO_ERRNO, "%s: Resizing pre_capture buffer to %d items",
                        new_size);
 
-#ifdef HAVE_FFMPEG
-{int i;
-            for (i = 0; i < cnt->imgs.image_ring_size; i++) {
-                int j = (cnt->imgs.image_ring_out + i) % cnt->imgs.image_ring_size;
-                struct image_data *tail = &cnt->imgs.image_ring[j];
-                if (tail->is_key_frame) {
-                    ffmpeg_packet_buffer_clear(cnt->gap_pkts);
-                    ffmpeg_packet_buffer_unref(cnt->gop_pkts);
-                    cnt->gop_start_pts = tail->pts;
-                }
-                if (tail->is_key_frame || ffmpeg_packet_buffer_count(cnt->gop_pkts) > 0)
-                    ffmpeg_packet_buffer_move(cnt->gop_pkts, tail->frame_pkts);
-                else
-                    ffmpeg_packet_buffer_unref(tail->frame_pkts);
-                tail->pts = AV_NOPTS_VALUE;
-                tail->is_key_frame = 0;
-            }
-}
-#endif
-
             /* Create memory for new ring buffer */
             struct image_data *tmp;
             tmp = mymalloc(new_size * sizeof(struct image_data));
@@ -157,9 +137,6 @@ static void image_ring_resize(struct context *cnt, int new_size)
                 for(i = smallest; i < new_size; i++) {
                     tmp[i].image = mymalloc(cnt->imgs.size);
                     memset(tmp[i].image, 0x80, cnt->imgs.size);  /* initialize to grey */
-#ifdef HAVE_FFMPEG
-                    tmp[i].frame_pkts = ffmpeg_packet_buffer_new();
-#endif
                 }
             }
 
@@ -168,9 +145,6 @@ static void image_ring_resize(struct context *cnt, int new_size)
                 int i;
                 for (i = smallest; i < cnt->imgs.image_ring_size; i++) {
                     free(tmp[i].image);
-#ifdef HAVE_FFMPEG
-                    ffmpeg_packet_buffer_free(tmp[i].frame_pkts);
-#endif
                 }
             }
 
@@ -211,12 +185,6 @@ static void image_ring_destroy(struct context *cnt)
     /* Free all image buffers */
     for (i = 0; i < cnt->imgs.image_ring_size; i++)
         free(cnt->imgs.image_ring[i].image);
-
-#ifdef HAVE_FFMPEG
-    /* Free all saved packets */
-    for (i = 0; i < cnt->imgs.image_ring_size; i++)
-        ffmpeg_packet_buffer_free(cnt->imgs.image_ring[i].frame_pkts);
-#endif
 
     /* Free the ring */
     free(cnt->imgs.image_ring);
@@ -679,11 +647,6 @@ static void process_image_ring(struct context *cnt, unsigned int max_images)
                   &cnt->imgs.image_ring[cnt->imgs.image_ring_out],
                   &cnt->imgs.image_ring[cnt->imgs.image_ring_out].timestamp_tv);
 
-#ifdef HAVE_FFMPEG
-            /* No longer need earlier frames to fill in gaps */
-            ffmpeg_packet_buffer_clear(cnt->gap_pkts);
-#endif
-
             /*
              * Check if we must add any "filler" frames into movie to keep up fps
              * Only if we are recording videos ( ffmpeg or extenal pipe )
@@ -944,8 +907,8 @@ static int motion_init(struct context *cnt)
     }
 
 #ifdef HAVE_FFMPEG
-    cnt->gap_pkts = ffmpeg_packet_buffer_new();
-    cnt->gop_pkts = ffmpeg_packet_buffer_new();
+    cnt->recent_packets = ffmpeg_packet_buffer_new();
+    cnt->last_serial = -1;
 #endif
 
     /* set the device settings */
@@ -974,6 +937,9 @@ static int motion_init(struct context *cnt)
 
     cnt->imgs.ref = mymalloc(cnt->imgs.size);
     cnt->imgs.out = mymalloc(cnt->imgs.size);
+#ifdef HAVE_FFMPEG
+    cnt->imgs.out_sub = mymalloc(cnt->imgs.motionsize);
+#endif
 
     /* contains the moving objects of ref. frame */
     cnt->imgs.ref_dyn = mymalloc(cnt->imgs.motionsize * sizeof(*cnt->imgs.ref_dyn));
@@ -1223,7 +1189,8 @@ static int motion_init(struct context *cnt)
         cnt->conf.frame_limit = 2;
 
     /* 2 sec startup delay so FPS is calculated correct */
-    cnt->startup_frames = (cnt->conf.frame_limit * 2) + cnt->conf.pre_capture + cnt->conf.minimum_motion_frames;
+    cnt->init_startup_frames = (cnt->conf.frame_limit * 2) + cnt->conf.pre_capture + cnt->conf.minimum_motion_frames;
+    cnt->startup_frames = cnt->init_startup_frames;
 
     cnt->required_frame_time = 1000000L / cnt->conf.frame_limit;
 
@@ -1323,6 +1290,11 @@ static void motion_cleanup(struct context *cnt)
         vid_close(cnt);
     }
 
+#ifdef HAVE_FFMPEG
+    free(cnt->imgs.out_sub);
+    cnt->imgs.out_sub = NULL;
+#endif
+
     free(cnt->imgs.out);
     cnt->imgs.out = NULL;
 
@@ -1366,16 +1338,8 @@ static void motion_cleanup(struct context *cnt)
     cnt->imgs.preview_image.image = NULL;
 
 #ifdef HAVE_FFMPEG
-    /*
-     * Don't unref the packets in gap_pkts, as they are also
-     * present in gop_pkts, and gop_pkts is a superset
-     */
-    ffmpeg_packet_buffer_clear(cnt->gap_pkts);
-    ffmpeg_packet_buffer_free(cnt->gap_pkts);
-    cnt->gap_pkts = NULL;
-
-    ffmpeg_packet_buffer_free(cnt->gop_pkts);
-    cnt->gop_pkts = NULL;
+    ffmpeg_packet_buffer_free(cnt->recent_packets);
+    cnt->recent_packets = NULL;
 #endif
 
     image_ring_destroy(cnt); /* Cleanup the precapture ring buffer */
@@ -1592,9 +1556,6 @@ static void mlp_prepare(struct context *cnt){
 static void mlp_resetimages(struct context *cnt){
 
     struct image_data *old_image;
-#ifdef HAVE_FFMPEG
-    int is_key, to_gap, to_gop;
-#endif
 
     if (cnt->conf.minimum_frame_time) {
         cnt->minimum_frame_time_downcounter = cnt->conf.minimum_frame_time;
@@ -1615,29 +1576,15 @@ static void mlp_resetimages(struct context *cnt){
     old_image = cnt->current_image;
     cnt->current_image = &cnt->imgs.image_ring[cnt->imgs.image_ring_in];
 
-#ifdef HAVE_FFMPEG
-    /*
-     * Note: The '&& to_gop' in the 'to_gap' condition is needed to avoid
-     * memory leaks. gop_pkts must always be a superset of gap_pkts, or
-     * else avoiding leaks (or double-frees) becomes more complicated.
+    /* Get rid of packets we no longer need
      */
-    is_key = cnt->current_image->is_key_frame;
-    to_gop = is_key || ffmpeg_packet_buffer_count(cnt->gop_pkts) > 0;
-    to_gap = !is_key && !(cnt->current_image->flags & IMAGE_SAVED) && to_gop;
-    if (is_key) {
-        ffmpeg_packet_buffer_clear(cnt->gap_pkts);
-        ffmpeg_packet_buffer_unref(cnt->gop_pkts);
-        cnt->gop_start_pts = cnt->current_image->pts;
-    }
-    if (to_gap)
-        ffmpeg_packet_buffer_copy(cnt->gap_pkts, cnt->current_image->frame_pkts);
-    if (to_gop)
-        ffmpeg_packet_buffer_move(cnt->gop_pkts, cnt->current_image->frame_pkts);
-    else
-        ffmpeg_packet_buffer_unref(cnt->current_image->frame_pkts);
-    cnt->current_image->pts = AV_NOPTS_VALUE;
-    cnt->current_image->is_key_frame = 0;
-#endif
+    ffmpeg_packet_buffer_prune(cnt->recent_packets, cnt->current_image->serial, cnt->video_stream_index);
+
+    /* Check that the packet buffer isn't growing without bound
+     * (provided the ring buffer is reasonably sized)
+     */
+    assert(cnt->imgs.image_ring_size > 100 ||
+           ffmpeg_packet_buffer_count(cnt->recent_packets) < 500);
 
     /* Init/clear current_image */
     if (cnt->process_thisframe) {
@@ -2112,6 +2059,12 @@ static void mlp_overlay(struct context *cnt){
                   cnt->imgs.width, tmp, cnt->conf.text_double);
     }
 
+#ifdef HAVE_FFMPEG
+    if (cnt->ffmpeg_output && cnt->missing_frame_counter == 0) {
+        ffmpeg_encode_subtitle(cnt->ffmpeg_output, cnt->recent_packets, cnt->imgs.out_sub, cnt->last_pts);
+        cnt->current_image->packet_count++;
+    }
+#endif
 }
 
 static void mlp_actions(struct context *cnt){
@@ -2197,8 +2150,6 @@ static void mlp_actions(struct context *cnt){
                        cnt->postcap);
         } else {
             cnt->current_image->flags |= IMAGE_PRECAP;
-            if (cnt->ffmpeg_output)
-                cnt->ffmpeg_output->passthru_started = 0;
         }
 
         /* Always call motion_detected when we have a motion image */
@@ -2215,8 +2166,6 @@ static void mlp_actions(struct context *cnt){
         /* gapless movie feature */
         if ((cnt->conf.event_gap == 0) && (cnt->detecting_motion == 1))
             cnt->makemovie = 1;
-        if (cnt->ffmpeg_output)
-            cnt->ffmpeg_output->passthru_started = 0;
         cnt->detecting_motion = 0;
     }
 
@@ -2244,17 +2193,14 @@ static void mlp_actions(struct context *cnt){
         if (cnt->event_nr == cnt->prev_event || cnt->makemovie) {
 
             /* Flush image buffer */
-            process_image_ring(cnt, IMAGE_BUFFER_FLUSH);
+            if (cnt->startup_frames == 0 && cnt->missing_frame_counter == 0)
+                process_image_ring(cnt, IMAGE_BUFFER_FLUSH);
 
             /* Save preview_shot here at the end of event */
             if (cnt->imgs.preview_image.diffs) {
                 preview_save(cnt);
                 cnt->imgs.preview_image.diffs = 0;
             }
-
-#ifdef HAVE_FFMPEG
-            ffmpeg_packet_buffer_clear(cnt->gap_pkts);
-#endif
 
             event(cnt, EVENT_ENDMOTION, NULL, NULL, NULL, &cnt->current_image->timestamp_tv);
 
@@ -2285,9 +2231,8 @@ static void mlp_actions(struct context *cnt){
     }
 
     /* Save/send to movie some images */
-    process_image_ring(cnt, 2);
-
-
+    if (cnt->startup_frames == 0 && cnt->missing_frame_counter == 0)
+        process_image_ring(cnt, 2);
 }
 
 static void mlp_setupmode(struct context *cnt){

@@ -101,6 +101,9 @@
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
+#define MINVAL(x, y) ((x) < (y) ? (x) : (y))
+#define MAXVAL(x, y) ((x) > (y) ? (x) : (y))
+
 #define VIDEO_PALETTE_GREY      1       /* Linear greyscale */
 #define VIDEO_PALETTE_HI240     2       /* High 240 cube (BT848) */
 #define VIDEO_PALETTE_RGB565    3       /* 565 16 bit RGB */
@@ -211,6 +214,8 @@
 #define UPDATE_REF_FRAME  1
 #define RESET_REF_FRAME   2
 
+#define MAX_STREAMS       8
+
 /* Forward declaration, used in track.h */
 struct images;
 
@@ -267,9 +272,8 @@ struct image_data {
     int total_labels;
 
 #ifdef HAVE_FFMPEG
-    struct packet_buff *frame_pkts;
-    int64_t pts;
-    int is_key_frame;
+    int64_t serial;
+    int packet_count;
 #endif
 };
 
@@ -311,6 +315,9 @@ struct images {
 
     unsigned char *ref;               /* The reference frame */
     unsigned char *out;               /* Picture buffer for motion images */
+#ifdef HAVE_FFMPEG
+    uint8_t *out_sub;                 /* For passthru subtitle overlay */
+#endif
     int *ref_dyn;                     /* Dynamic objects to be excluded from reference frame */
     unsigned char *image_virgin;      /* Last picture frame with no text or locate overlay */
     struct image_data preview_image;  /* Picture buffer for best image when enables */
@@ -428,6 +435,7 @@ struct context {
     time_t connectionlosttime;               /* timestamp from connection lost */
 
     unsigned int lastrate;
+    unsigned int init_startup_frames;
     unsigned int startup_frames;
     unsigned int moved;
     unsigned int pause;
@@ -472,9 +480,9 @@ struct context {
 #ifdef HAVE_FFMPEG
     void *rtsp_format_context;  /* actually an AVFormatContext */
     int video_stream_index;
-    struct packet_buff *gap_pkts;
-    struct packet_buff *gop_pkts;
-    int64_t gop_start_pts;
+    struct packet_buff *recent_packets;
+    int64_t last_serial;
+    int64_t last_pts;
 #endif
 
     int area_minx[9], area_miny[9], area_maxx[9], area_maxy[9];

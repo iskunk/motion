@@ -28,8 +28,6 @@ Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA. */
 #include <sys/types.h>
 #include <sys/socket.h>
 
-#define MINVAL(x, y) ((x) < (y) ? (x) : (y))
-
 /* This file contains the generic routines for work with headers.
    Currently they are used only by HTTP in http.c, but they can be
    used by anything that cares about RFC822-style headers.

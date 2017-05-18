@@ -20,6 +20,7 @@ struct rtsp_context {
     AVFrame*              swsframe_out;
     int                   swsframe_size;
     int                   video_stream_index;
+    int64_t               last_dts[MAX_STREAMS];
     int64_t               packet_serial;
     char*                 path;
     char*                 user;

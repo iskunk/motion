@@ -53,7 +53,6 @@
 #define POLLING_TIMEOUT  READ_TIMEOUT /* File polling timeout [s] */
 #define POLLING_TIME  500*1000*1000   /* File polling time quantum [ns] (500ms) */
 #define MAX_HEADER_RETRIES      5     /* Max tries to find a header record */
-#define MINVAL(x, y) ((x) < (y) ? (x) : (y))
 
 tfile_context *file_new_context(void);
 void file_free_context(tfile_context* ctxt);
@@ -1077,19 +1076,6 @@ void netcam_image_read_complete(netcam_context_ptr netcam)
     netcam->receiving = xchg;
     netcam->imgcnt++;
 
-#ifdef HAVE_FFMPEG
-    ffmpeg_packet_buffer_unref(netcam->receiving->frame_pkts);
-    netcam->receiving->pts = AV_NOPTS_VALUE;
-    netcam->receiving->is_key_frame = 0;
-#endif
-
-    /*
-     * We have a new frame ready.  We send a signal so that
-     * any thread (e.g. the motion main loop) waiting for the
-     * next frame to become available may proceed.
-     */
-    netcam->get_picture = 1;
-    pthread_cond_signal(&netcam->pic_ready);
     pthread_mutex_unlock(&netcam->mutex);
 }
 
@@ -1802,35 +1788,7 @@ static void *netcam_handler_loop(void *arg)
 
     while (!netcam->finish) {
 
-#if 1
-        if (netcam->caps.streaming == NCS_UNSUPPORTED
-/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP) {
-            pthread_mutex_lock(&netcam->mutex);
-
-            /*
-             * If the motion main-loop has not requested a capture
-             * yet, then we do a conditional wait (wait for signal).
-             * On the other hand, if the motion main-loop has already
-             * signalled us, we just continue.  In either event, we
-             * clear the start_capture flag set by the main loop.
-             */
-            while (!netcam->start_capture && !netcam->finish) {
-                struct timespec waittime;
-                waittime.tv_sec  = time(NULL) + 2;
-                waittime.tv_nsec = 0;
-                if (pthread_cond_timedwait(&netcam->cap_cond, &netcam->mutex, &waittime) == 0)
-                    break;
-            }
-
-            netcam->start_capture = 0;
-
-            pthread_mutex_unlock(&netcam->mutex);
-        }
-#endif /* 1 */
-
         restart:
-
-        if (netcam->finish) break;
 
         if (netcam->response) {    /* If html input */
             if (netcam->caps.streaming == NCS_UNSUPPORTED) {
@@ -1960,35 +1918,23 @@ static void *netcam_handler_loop(void *arg)
          */
 
         /*
-         * If non-streaming, want to synchronize our thread with the
-         * motion main-loop.
+         * If non-streaming, or in passthru mode, then we want to
+         * synchronize our thread with the motion main-loop.
          */
-#if 0
-        if (netcam->caps.streaming == NCS_UNSUPPORTED
-/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP) {
-            pthread_mutex_lock(&netcam->mutex);
 
-            /*
-             * If our current loop has finished before the next
-             * request from the motion main-loop, we do a
-             * conditional wait (wait for signal).  On the other
-             * hand, if the motion main-loop has already signalled
-             * us, we just continue.  In either event, we clear
-             * the start_capture flag set by the main loop.
+        if (netcam->caps.streaming == NCS_UNSUPPORTED ||
+            (netcam->caps.streaming == NCS_RTSP /*&& in_passthru_mode*/)) {
+
+            /* First barrier: Wait until the motion-loop is ready to
+             * copy over the image
              */
-            while (!netcam->start_capture && !netcam->finish) {
-                struct timespec waittime;
-                waittime.tv_sec  = time(NULL) + 2;
-                waittime.tv_nsec = 0;
-                if (pthread_cond_timedwait(&netcam->cap_cond, &netcam->mutex, &waittime) == 0)
-                    break;
-            }
+            pthread_barrier_wait(&netcam->barrier);
 
-            netcam->start_capture = 0;
-
-            pthread_mutex_unlock(&netcam->mutex);
+            /* Second barrier: Wait for the image copy to complete
+             */
+            pthread_barrier_wait(&netcam->barrier);
         }
-#endif /* 0 */
+
     /* The loop continues forever, or until motion shutdown. */
     }
 
@@ -2412,6 +2358,7 @@ ssize_t netcam_recv(netcam_context_ptr netcam, void *buffptr, size_t buffsize)
 void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
 {
     struct timespec waittime;
+    int do_barriers = 0;
 
     if (!netcam)
         return;
@@ -2435,23 +2382,27 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
      */
     netcam->cnt->netcam = NULL;
 
+    if (netcam->caps.streaming == NCS_UNSUPPORTED ||
+        (netcam->caps.streaming == NCS_RTSP /*&& in_passthru_mode*/)) {
+        do_barriers = 1;
+    }
+
     /*
      * Next we set 'finish' in order to get the camera-handler thread
      * to stop.
+     *
+     * If applicable, we do this between two synchronization barriers so
+     * that the flag changes state between the two corresponding barriers
+     * in netcam_handler_loop(). (What's important is that the flag
+     * changes state at a known point in the loop, because we can't
+     * otherwise conditionalize whether or not we enter the barriers in
+     * this cleanup routine. (Remember that POSIX barriers have no
+     * provision for timing out, so we need to be very careful here or
+     * else the camera handler will end up stuck in a deadlock.)
      */
+    if (do_barriers) pthread_barrier_wait(&netcam->barrier);
     netcam->finish = 1;
-
-    /*
-     * If the camera is non-streaming, the handler thread could be waiting
-     * for a signal, so we send it one.  If it's actually waiting on the
-     * condition, it won't actually start yet because we still have
-     * netcam->mutex locked.
-     */
-
-    if (netcam->caps.streaming == NCS_UNSUPPORTED
-/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP)
-        pthread_cond_signal(&netcam->cap_cond);
-
+    if (do_barriers) pthread_barrier_wait(&netcam->barrier);
 
     /*
      * Once the camera-handler gets to the end of it's loop (probably as
@@ -2499,7 +2450,7 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
     if (netcam->latest != NULL) {
         free(netcam->latest->ptr);
 #ifdef HAVE_FFMPEG
-        ffmpeg_packet_buffer_free(netcam->latest->frame_pkts);
+        ffmpeg_packet_buffer_free(netcam->latest->frame_packets);
 #endif
         free(netcam->latest);
     }
@@ -2507,7 +2458,7 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
     if (netcam->receiving != NULL) {
         free(netcam->receiving->ptr);
 #ifdef HAVE_FFMPEG
-        ffmpeg_packet_buffer_free(netcam->receiving->frame_pkts);
+        ffmpeg_packet_buffer_free(netcam->receiving->frame_packets);
 #endif
         free(netcam->receiving);
     }
@@ -2530,9 +2481,8 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
         netcam_shutdown_rtsp(netcam);
 
     pthread_mutex_destroy(&netcam->mutex);
-    pthread_cond_destroy(&netcam->cap_cond);
-    pthread_cond_destroy(&netcam->pic_ready);
     pthread_cond_destroy(&netcam->exiting);
+    pthread_barrier_destroy(&netcam->barrier);
     free(netcam);
 }
 
@@ -2573,19 +2523,6 @@ int netcam_next(struct context *cnt, unsigned char *image)
         return NETCAM_NOTHING_NEW_ERROR;
     }
 #endif
-
-    /*
-     * If we are controlling a non-streaming camera, we synchronize the
-     * motion main-loop with the camera-handling thread through a signal,
-     * together with a flag to say "start your next capture".
-     */
-    if (netcam->caps.streaming == NCS_UNSUPPORTED
-/* XXX: passthru */ || netcam->caps.streaming == NCS_RTSP) {
-        pthread_mutex_lock(&netcam->mutex);
-        netcam->start_capture = 1;
-        pthread_cond_signal(&netcam->cap_cond);
-        pthread_mutex_unlock(&netcam->mutex);
-    }
 
     if (netcam->caps.streaming == NCS_RTSP) {
 
@@ -2662,15 +2599,14 @@ int netcam_start(struct context *cnt)
     netcam->timeout.tv_sec = READ_TIMEOUT;
 
 #ifdef HAVE_FFMPEG
-    netcam->receiving->frame_pkts = ffmpeg_packet_buffer_new();
-    netcam->latest->frame_pkts    = ffmpeg_packet_buffer_new();
+    netcam->receiving->frame_packets = ffmpeg_packet_buffer_new();
+    netcam->latest->frame_packets    = ffmpeg_packet_buffer_new();
 #endif
 
     /* Thread control structures */
     pthread_mutex_init(&netcam->mutex, NULL);
-    pthread_cond_init(&netcam->cap_cond, NULL);
-    pthread_cond_init(&netcam->pic_ready, NULL);
     pthread_cond_init(&netcam->exiting, NULL);
+    pthread_barrier_init(&netcam->barrier, NULL, 2);
 
     /* Initialise the average frame time to the user's value. */
     netcam->av_frame_time = 1000000.0 / cnt->conf.frame_limit;

@@ -93,9 +93,10 @@ typedef struct netcam_image_buff {
     size_t used;                    /* bytes already used */
     struct timeval image_time;      /* time this image was received */
 #ifdef HAVE_FFMPEG
-    struct packet_buff *frame_pkts;
+    struct packet_buff *frame_packets;
+    int64_t serial;
+    int packet_count;
     int64_t pts;
-    int is_key_frame;
 #endif
 } netcam_buff;
 typedef netcam_buff *netcam_buff_ptr;
@@ -146,23 +147,8 @@ typedef struct netcam_context {
                                    the camera-handler acknowledge that
                                    it's finished */
 
-    pthread_cond_t cap_cond;    /* pthread condition structure to
-                                   initiate next capture request (used
-                                   only with non-streaming cameras */
-
-    pthread_cond_t pic_ready;   /* pthread condition structure used
-                                    for synchronisation between the
-                                    camera handler and the motion main
-                                    loop, showing new frame is ready */
-
-    int start_capture;          /* besides our signalling condition,
-                                   we also keep a flag to assure the
-                                   camera-handler will always start
-                                   a new cycle as soon as possible,
-                                   even if it's not currently waiting
-                                   on the condition. */
-
-    int get_picture;            /* flag to likewise supplement pic_ready */
+    pthread_barrier_t barrier;  /* pthread barrier to keep the camera
+                                   handler and motion main loop in sync */
 
     char *connect_host;         /* the host to connect to (may be
                                    either the camera host, or

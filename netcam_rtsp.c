@@ -165,13 +165,6 @@ static int rtsp_decode_packet(AVPacket *packet, netcam_buff_ptr buffer, AVFrame 
     int frame_size;
     int retcd;
 
-    if (packet) {
-        if (buffer->pts == AV_NOPTS_VALUE)
-            buffer->pts = packet->pts;
-        if (packet->flags & AV_PKT_FLAG_KEY)
-            buffer->is_key_frame = 1;
-    }
-
     retcd = rtsp_decode_video(packet, frame, ctx_codec);
     if (retcd <= 0) return retcd;
 
@@ -253,6 +246,11 @@ static int netcam_open_codec(netcam_context_ptr netcam){
      }
 
 #endif
+
+    /* FIXME: seems like this may be desirable for passthru mode
+     * (is it?) but don't set it in non-passthru
+     */
+    netcam->rtsp->codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
     retcd = avcodec_open2(netcam->rtsp->codec_context, decoder, NULL);
     if ((retcd < 0) || (netcam->rtsp->interrupted == 1)){
@@ -380,8 +378,11 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
     /* Point to our working buffer. */
     buffer = netcam->receiving;
     buffer->used = 0;
+    buffer->serial = netcam->rtsp->packet_serial;
+    buffer->packet_count = 0;
+    buffer->pts = AV_NOPTS_VALUE;
 
-    assert(ffmpeg_packet_buffer_count(buffer->frame_pkts) == 0);
+    ffmpeg_packet_buffer_unref(buffer->frame_packets);
 
     av_init_packet(&packet);
     packet.data = NULL;
@@ -400,6 +401,20 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
     size_decoded = rtsp_decode_packet(NULL, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
 
     while (size_decoded == 0 && av_read_frame(netcam->rtsp->format_context, &packet) >= 0) {
+        buffer->packet_count++;
+
+        /* Re-purpose the .pos field to store a packet serial number
+         */
+        packet.pos = netcam->rtsp->packet_serial++;
+#if 1
+fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] IN\n",
+  packet.stream_index,
+  packet.pts,
+  (int)packet.duration,
+  packet.pos,
+  packet.flags & AV_PKT_FLAG_KEY ? 'K' : ' '
+);
+#endif
 
         /* This seems to occur for the first packet received after
          * reconnecting to a camera
@@ -409,31 +424,25 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
             packet.dts = packet.pts = 0;
         }
 
+        /* Some cameras will occasionally send a packet with an
+         * out-of-order decompression timestamp. We'll let this slide
+         * if it's in the first few packets, but otherwise we bail out.
+         * Correcting these timestamps on-the-fly is too hard to do here
+         * and camera manufacturers really ought to know better :p
+         */
+        if (packet.dts <= netcam->rtsp->last_dts[packet.stream_index]) {
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Received packet with non-increasing dts!");
+            if (packet.pos >= 10)
+                break;
+        }
+        netcam->rtsp->last_dts[packet.stream_index] = packet.dts;
+
         if (packet.stream_index == netcam->rtsp->video_stream_index) {
             video_packet_count++;
             size_decoded = rtsp_decode_packet(&packet, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
-
-            /* Rare weirdness
-             */
-            if (size_decoded > 0 && video_packet_count >= 2 &&
-                packet.flags & AV_PKT_FLAG_KEY) {
-                MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Keyframe packet is required by preceding frame");
-                buffer->is_key_frame = 0;
-            }
         }
 
-        /* Re-purpose the .pos field to store a packet serial number
-         */
-        packet.pos = netcam->rtsp->packet_serial++;
-
-        ffmpeg_packet_buffer_add(buffer->frame_pkts, &packet);
-#if 1
-fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] IN  \\\n",
-  packet.stream_index,
-  packet.pts,
-  packet.pos,
-  packet.flags & AV_PKT_FLAG_KEY ? 'I' : 'P');
-#endif
+        ffmpeg_packet_buffer_add(buffer->frame_packets, &packet);
 
         av_init_packet(&packet);
         packet.data = NULL;
@@ -449,6 +458,18 @@ fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] IN  \\\n",
         netcam_rtsp_close_context(netcam);
         return -1;
     }
+
+    buffer->pts = (netcam->rtsp->frame->pts != AV_NOPTS_VALUE) ?
+        netcam->rtsp->frame->pts : netcam->rtsp->frame->pkt_dts;
+#if 1
+assert(netcam->rtsp->frame->repeat_pict == 0);
+fprintf(stderr, " frame: pts=%09ld pkt_dts=%09ld count=%d type=%c [%c]\n",
+  netcam->rtsp->frame->pts,
+  netcam->rtsp->frame->pkt_dts,
+  buffer->packet_count,
+  av_get_picture_type_char(netcam->rtsp->frame->pict_type),
+  netcam->rtsp->frame->key_frame ? 'K' : ' ');
+#endif
 
     if ((netcam->width  != (unsigned)netcam->rtsp->codec_context->width) ||
         (netcam->height != (unsigned)netcam->rtsp->codec_context->height) ||
@@ -545,7 +566,7 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
     int  retcd;
     char errstr[128];
     char optsize[10], optfmt[8], optfps[5];
-
+    int i;
 
     if (netcam->rtsp->path == NULL) {
         if (netcam->rtsp->status == RTSP_NOTCONNECTED){
@@ -554,14 +575,17 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
         return -1;
     }
 
+    netcam->rtsp->packet_serial = 0;
+
     // open the network connection
     AVDictionary *opts = 0;
     netcam->rtsp->format_context = avformat_alloc_context();
     netcam->rtsp->format_context->interrupt_callback.callback = netcam_interrupt_rtsp;
     netcam->rtsp->format_context->interrupt_callback.opaque = netcam;
 
-    /* Passthru mode needs the format context */
+    /* Passthru mode needs these */
     netcam->cnt->rtsp_format_context = netcam->rtsp->format_context;
+    netcam->cnt->video_stream_index  = netcam->rtsp->video_stream_index;
 
     netcam->rtsp->interrupted = 0;
     if (gettimeofday(&netcam->rtsp->startreadtime, NULL) < 0) {
@@ -623,13 +647,17 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
     // fill out stream information
     retcd = avformat_find_stream_info(netcam->rtsp->format_context, NULL);
     if ((retcd < 0) || (netcam->rtsp->interrupted == 1)){
-        if (netcam->rtsp->status == RTSP_NOTCONNECTED){
+        if (retcd < 0 && netcam->rtsp->status == RTSP_NOTCONNECTED) {
             av_strerror(retcd, errstr, sizeof(errstr));
             MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: unable to find stream info: %s", errstr);
         }
         netcam_rtsp_close_context(netcam);
         return -1;
     }
+
+    assert(netcam->rtsp->format_context->nb_streams <= MAX_STREAMS);
+    for (i = 0; i < netcam->rtsp->format_context->nb_streams; i++)
+        netcam->rtsp->last_dts[i] = INT64_MIN;
 
     /* there is no way to set the avcodec thread names, but they inherit
      * our thread name - so temporarily change our thread name to the
@@ -904,9 +932,6 @@ int netcam_connect_rtsp(netcam_context_ptr netcam){
     if (netcam_read_rtsp_image(netcam) < 0) return -1;
 #endif /* 0 */
 
-    ffmpeg_packet_buffer_unref(netcam->latest->frame_pkts);
-    ffmpeg_packet_buffer_unref(netcam->receiving->frame_pkts);
-
     netcam->rtsp->status = RTSP_CONNECTED;
 
     MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Camera connected");
@@ -1118,34 +1143,43 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
      * The netcam mutex *only* protects netcam->latest, it cannot be
      * used to safely call other netcam functions. */
 
+    /* First barrier: Wait for netcam handler to finish reading image
+     */
+    pthread_barrier_wait(&netcam->barrier);
+
     pthread_mutex_lock(&netcam->mutex);
-
-    while (!netcam->get_picture) {
-        struct timespec waittime;
-        waittime.tv_sec  = time(NULL) + 2;
-        waittime.tv_nsec = 0;
-        if (pthread_cond_timedwait(&netcam->pic_ready, &netcam->mutex, &waittime) == 0)
-            break;
-        if (netcam->cnt->finish)
-            goto done;
-    }
-
-    netcam->get_picture = 0;
 
     memcpy(image, netcam->latest->ptr, netcam->latest->used);
 
 #ifdef HAVE_FFMPEG
-    /* Passthru HAAAACK */
+    ffmpeg_packet_buffer_move(netcam->cnt->recent_packets, netcam->latest->frame_packets);
     assert(image == netcam->cnt->current_image->image);
-    assert(ffmpeg_packet_buffer_count(netcam->cnt->current_image->frame_pkts) == 0);
-    ffmpeg_packet_buffer_move(netcam->cnt->current_image->frame_pkts, netcam->latest->frame_pkts);
-    netcam->cnt->current_image->pts = netcam->latest->pts;
-    netcam->cnt->current_image->is_key_frame = netcam->latest->is_key_frame;
+    netcam->cnt->current_image->serial       = netcam->latest->serial;
+    netcam->cnt->current_image->packet_count = netcam->latest->packet_count;
+    if (netcam->latest->serial < netcam->cnt->last_serial) {
+        /*
+         * Stream has restarted! Finish writing any open movie file
+         */
+        if (netcam->cnt->ffmpeg_output)
+            netcam->cnt->makemovie = 1;
+        /*
+         * Ensure that we read in (and discard) a full GOP before we start
+         * passthru recording, as some cameras are known to send bogus
+         * packet timestamps early in the stream after reconnecting. (It's
+         * not enough just to discard the first few packets, because we
+         * still need to be able to reach back for a "key" packet)
+         */
+        netcam->cnt->startup_frames = MAXVAL(netcam->cnt->init_startup_frames, 100);
+    }
+    netcam->cnt->last_serial = netcam->latest->serial;
+    netcam->cnt->last_pts    = netcam->latest->pts;
 #endif /* HAVE_FFMPEG */
 
-    done:
-
     pthread_mutex_unlock(&netcam->mutex);
+
+    /* Second barrier: Allow netcam handler to read next image
+     */
+    pthread_barrier_wait(&netcam->barrier);
 
     if (netcam->cnt->rotate_data.degrees > 0)
         /* Rotate as specified */

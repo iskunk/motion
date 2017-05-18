@@ -757,16 +757,15 @@ static void event_ffmpeg_newfile(struct context *cnt,
              * it to be valid during movie setup)
              */
             cnt->ffmpeg_output->rtsp_format_context = (AVFormatContext *)cnt->rtsp_format_context;
+            cnt->ffmpeg_output->video_stream_index = cnt->video_stream_index;
             st = cnt->ffmpeg_output->rtsp_format_context->streams[cnt->video_stream_index];
 #if (LIBAVFORMAT_VERSION_MAJOR >= 57)
             cnt->ffmpeg_output->passthru_codec_id = st->codecpar->codec_id;
 #else
             cnt->ffmpeg_output->passthru_codec_id = st->codec->codec_id;
 #endif
-            cnt->ffmpeg_output->passthru_time_base = st->time_base;
             cnt->ffmpeg_output->passthru_last_serial = -1;
-
-            ffmpeg_packet_buffer_clear(cnt->gap_pkts);
+            cnt->ffmpeg_output->last_pts = AV_NOPTS_VALUE;
         }
 #endif /* HAVE_FFMPEG */
 
@@ -902,97 +901,8 @@ static void event_ffmpeg_put(struct context *cnt,
             /*
              * Passthru mode
              */
-            int stream_restarted = 0;
-            int write_frame = 1;
-            if (imgdata->pts < cnt->ffmpeg_output->last_pts) {
-                stream_restarted = 1;
-                cnt->ffmpeg_output->passthru_started = 0;
-            }
-            if (!cnt->ffmpeg_output->passthru_started) {
-                /*
-                 * Starting a new passthru sequence; next frame written
-                 * out MUST be a key frame
-                 */
-                int64_t start_pts = -1;
-                int write_gap = 0;
-                int write_gop = 0;
-                if (imgdata->is_key_frame) {
-                    /*
-                     * Either we lucked out and just happened to start
-                     * on a key frame, or we've been dropping frames due
-                     * to a missing key frame and our bad luck has ended
-                     */
-fprintf(stderr, "event_ffmpeg_put: starting new sequence (key frame)\n");
-                    if (cnt->ffmpeg_output->passthru_frames_lost > 0) {
-                        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO, "%s: Dropped %d frame(s) from passthru movie due to missing GOP filler", cnt->ffmpeg_output->passthru_frames_lost);
-                        cnt->ffmpeg_output->passthru_frames_lost = 0;
-                    }
-                    start_pts = imgdata->pts;
-                    cnt->ffmpeg_output->passthru_last_serial = -1;
-                } else if (ffmpeg_packet_buffer_count(cnt->gap_pkts) > 0 &&
-                           cnt->gop_start_pts <= cnt->ffmpeg_output->last_pts &&
-                           !stream_restarted) {
-                    /*
-                     * Not a key frame, but apparently we're still in the
-                     * same GOP as the end of the last sequence. Rather
-                     * than re-start the GOP (which would show as an ugly
-                     * jump back in time in the video), we complete it so
-                     * the video shows no gap whatsoever
-                     */
-fprintf(stderr, "event_ffmpeg_put: continuing last sequence\n");
-                    write_gap = 1;
-                } else if (ffmpeg_packet_buffer_count(cnt->gop_pkts) > 0 &&
-                           cnt->gop_start_pts < imgdata->pts) {
-                    /*
-                     * Not a key frame, but we have all the preceding
-                     * frames from its containing GOP
-                     */
-fprintf(stderr, "event_ffmpeg_put: starting new sequence (GOP fill)\n");
-                    start_pts = cnt->gop_start_pts;
-                    write_gop = 1;
-                    cnt->ffmpeg_output->passthru_last_serial = -1;
-                } else {
-                    /*
-                     * Oh, crud... we have to drop this frame, because
-                     * it's not a key frame and we don't have the
-                     * prior frames necessary for it to show correctly
-                     */
-                    write_frame = 0;
-                }
-                /* Now, if this is not the first sequence in the file,
-                 * then we need to calculate the length of the gap between
-                 * the end of the previous sequence and the start of this
-                 * one. This will then be used to adjust a timestamp
-                 * offset that is applied to subsequent output, because
-                 * time discontinuities in the video cannot be reflected
-                 * in the packet timestamps (unless you like long pauses)
-                 *
-                 * Note that in some instances, the gap can be negative!
-                 */
-                if (start_pts >= 0 && cnt->ffmpeg_output->last_pts > 0) {
-                    int64_t gap_pts  = start_pts - cnt->ffmpeg_output->last_pts;
-                    int64_t gap_usec = av_rescale_q(gap_pts, cnt->ffmpeg_output->passthru_time_base, AV_TIME_BASE_Q);
-                    cnt->ffmpeg_output->passthru_ts_offset -= gap_usec;
-                    /* Don't overstep last frame of previous sequence */
-                    cnt->ffmpeg_output->passthru_ts_offset += 2 * AV_TIME_BASE / cnt->ffmpeg_output->fps;
-                }
-                if (write_gap && ffmpeg_put_packets(cnt->ffmpeg_output, cnt->gap_pkts) < 0) {
-                    MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error writing out GOP filler packets");
-                }
-                if (write_gop && ffmpeg_put_packets(cnt->ffmpeg_output, cnt->gop_pkts) < 0) {
-                    MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error writing out GOP filler packets");
-                }
-                if (write_frame)
-                    cnt->ffmpeg_output->passthru_started = 1;
-                else
-                    cnt->ffmpeg_output->passthru_frames_lost++;
-            }
-            if (write_frame) {
-                if (ffmpeg_put_packets(cnt->ffmpeg_output, imgdata->frame_pkts) < 0) {
-                    MOTION_LOG(ERR, TYPE_EVENTS, NO_ERRNO, "%s: Error writing out frame packet(s)");
-                }
-                cnt->ffmpeg_output->last_pts = imgdata->pts;
-            }
+            ffmpeg_put_packets(cnt->ffmpeg_output, cnt->recent_packets,
+                imgdata->serial, imgdata->packet_count);
         } else
 #endif /* HAVE_FFMPEG */
         if (ffmpeg_put_image(cnt->ffmpeg_output, img, currenttime_tv) == -1) {

@@ -227,6 +227,16 @@ static int ffmpeg_lockmgr_cb(void **arg, enum AVLockOp op){
 
 static void ffmpeg_free_context(struct ffmpeg *ffmpeg){
 
+#if (LIBAVFORMAT_VERSION_MAJOR < 57)
+# undef  data
+# define data pict.data
+#endif
+        if (ffmpeg->subtitle.rects != NULL) {
+            ffmpeg->subtitle.rects[0]->data[0] = NULL;
+            avsubtitle_free(&ffmpeg->subtitle);
+        }
+#undef data
+
         if (ffmpeg->picture != NULL){
             my_frame_free(ffmpeg->picture);
             ffmpeg->picture = NULL;
@@ -511,7 +521,7 @@ static int ffmpeg_set_codec(struct ffmpeg *ffmpeg){
     }
     ffmpeg->ctx_codec = avcodec_alloc_context3(ffmpeg->codec);
     if (ffmpeg->ctx_codec == NULL) {
-        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Failed to allocate decoder!");
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Failed to allocate codec context!");
         ffmpeg_free_context(ffmpeg);
         return -1;
     }
@@ -648,6 +658,98 @@ static int ffmpeg_set_picture(struct ffmpeg *ffmpeg){
 
     return 0;
 
+}
+
+static int ffmpeg_set_subtitle(struct ffmpeg *ffmpeg) {
+
+    AVStream *st;
+    AVSubtitle *sub;
+    AVSubtitleRect *rect;
+    uint32_t clut[4];
+
+    ffmpeg->codec = avcodec_find_encoder(AV_CODEC_ID_DVD_SUBTITLE);
+    if (!ffmpeg->codec) return -1;
+
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
+    ffmpeg->ctx_codec = avcodec_alloc_context3(ffmpeg->codec);
+    if (!ffmpeg->ctx_codec) return -1;
+
+    st = avformat_new_stream(ffmpeg->oc, NULL);
+    if (!st) return -1;
+    if (avcodec_parameters_from_context(st->codecpar, ffmpeg->ctx_codec) < 0)
+        return -1;
+#else
+    st = avformat_new_stream(ffmpeg->oc, ffmpeg->codec);
+    if (!st) return -1;
+
+    if (ffmpeg->oc->oformat->flags & AVFMT_GLOBALHEADER)
+        st->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    ffmpeg->ctx_codec = st->codec;
+#endif
+
+#if 0  /* FIXME: how do you get the player to show these by default? */
+    st->disposition = AV_DISPOSITION_DEFAULT | AV_DISPOSITION_FORCED;
+#endif
+    st->time_base   = ffmpeg->passthru_time_base;
+
+    av_dict_set(&st->metadata, "title", "Motion overlay", 0);
+
+    ffmpeg->subtitle_stream_index = st->index;
+
+    /* Set up AVSubtitle object */
+
+    sub = &ffmpeg->subtitle;
+    memset(sub, 0, sizeof(*sub));
+
+    sub->start_display_time = 0;
+    sub->end_display_time = 0;
+    sub->num_rects = 1;
+    sub->pts = AV_NOPTS_VALUE;
+
+    sub->rects = av_malloc(sizeof(*sub->rects));
+    if (!sub->rects) return -1;
+
+    sub->rects[0] = av_mallocz(sizeof(*sub->rects[0]));
+    if (!sub->rects[0]) return -1;
+
+    rect = sub->rects[0];
+    rect->x = 0;
+    rect->y = 0;
+    rect->w = ffmpeg->width;
+    rect->h = ffmpeg->height;
+    rect->nb_colors = 4;
+    rect->type = SUBTITLE_BITMAP;
+
+#if (LIBAVFORMAT_VERSION_MAJOR < 57)
+# define data     pict.data
+# define linesize pict.linesize
+#endif
+
+    rect->data[0] = NULL;  /* will be set to image later */
+
+    rect->data[1] = av_mallocz(AVPALETTE_SIZE);
+    if (!rect->data[1]) return -1;
+
+#define RGBA(r,g,b,a) (((uint32_t)(a) << 24) | ((r) << 16) | ((g) << 8) | (b))
+
+    /* Set up color look-up table
+     */
+    clut[0] = RGBA(  0,   0,   0,   0);  /* transparent */
+    clut[1] = RGBA(  0,   0,   0, 255);  /* black */
+    clut[2] = RGBA(255,   0,   0, 255);  /* red */
+    clut[3] = RGBA(255, 255, 255, 255);  /* white */
+
+#undef RBGA
+
+    memcpy(rect->data[1], clut, sizeof(clut));
+
+    rect->linesize[0] = ffmpeg->width;
+
+#undef data
+#undef linesize
+
+    return 0;
 }
 
 static int ffmpeg_set_outputfile(struct ffmpeg *ffmpeg){
@@ -897,13 +999,9 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
     switch (ffmpeg->passthru_codec_id) {
         case MY_CODEC_ID_H264:
         case MY_CODEC_ID_HEVC:
+        case MY_CODEC_ID_MJPEG:
         case MY_CODEC_ID_MPEG4:
         ffmpeg->codec_name = "mp4";
-        break;
-
-        case MY_CODEC_ID_MJPEG:
-        default:
-        ffmpeg->codec_name = "mov";
         break;
 
         /*
@@ -914,6 +1012,11 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
          * reflect what we got from the camera, and thereby prefer to
          * avoid rescaling the packet timestamps.
          */
+
+        default:
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Unsupported input format for passthru recording");
+        ffmpeg_free_context(ffmpeg);
+        return -1;
     }
 
     /* Make output timestamps start at zero, to avoid LONG pauses on the
@@ -977,6 +1080,13 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
         ost->time_base           = ist->time_base;
     }
 
+    retcd = ffmpeg_set_subtitle(ffmpeg);
+    if (retcd < 0) {
+        MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the subtitle");
+        ffmpeg_free_context(ffmpeg);
+        return -1;
+    }
+
     retcd = ffmpeg_set_outputfile(ffmpeg);
     if (retcd < 0) {
         MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Could not set the output file");
@@ -985,7 +1095,7 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
     }
 
 #ifndef NDEBUG
-    for (i = 0; i < ffmpeg->oc->nb_streams; i++) {
+    for (i = 0; i < ffmpeg->rtsp_format_context->nb_streams; i++) {
         AVStream *ist = ffmpeg->rtsp_format_context->streams[i];
         AVStream *ost = ffmpeg->oc->streams[i];
 
@@ -1133,52 +1243,121 @@ int ffmpeg_put_image(struct ffmpeg *ffmpeg, unsigned char *image, const struct t
 #endif // HAVE_FFMPEG
 }
 
-int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer) {
-#ifdef HAVE_FFMPEG
-    int retcd = 0;
+/* Returns the position in the buffer of the packet with the specified
+ * 'serial' number, or -1 if it is not found
+ */
+static int find_packet(struct packet_buff *buffer, int64_t serial) {
+    int i;
+
+    for (i = buffer->count - 1; i >= 0; i--)
+        if (buffer->array[i].pos == serial)
+            return i;
+
+    return -1;
+}
+
+/* Returns the position in the buffer of the last "key" packet with the
+ * given 'stream_index' at or before the packet with the given 'serial'
+ * number; or -1 if no such packet is found.
+ */
+static int find_key_packet(struct packet_buff *buffer, int64_t serial, int stream_index) {
+    int key_pos = -1;
     int i;
 
     for (i = 0; i < buffer->count; i++) {
         AVPacket *p = &buffer->array[i];
-        AVStream *ost = ffmpeg->oc->streams[p->stream_index];
-        AVPacket p_copy;
-#if 1
-fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] OUT /\n",
-  p->stream_index,
-  p->pts,
-  p->pos,
-  p->flags & AV_PKT_FLAG_KEY ? 'I' : 'P');
-#endif
+        if (p->stream_index == stream_index && p->flags & AV_PKT_FLAG_KEY)
+            key_pos = i;
+        if (p->pos == serial)
+            break;
+    }
 
+    return key_pos;
+}
+
+int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_t frame_serial, int packet_count) {
+#ifdef HAVE_FFMPEG
+
+    AVPacket *start_pkt;
+    int start_pos = -1, end_pos;
+    int retcd = 0;
+    int i;
+
+    assert(buffer->count > 0);
+    assert(frame_serial >= buffer->array[0].pos);
+    assert(frame_serial > ffmpeg->passthru_last_serial);
+
+    if (frame_serial == ffmpeg->passthru_last_serial + 1) {
         /*
-         * Remember that we are (ab)using the packet's .pos field to
-         * store a serial number (see netcam_read_rtsp_image()) and are
-         * keeping track of the serial number of the last packet written
-         * out to the movie file. Using those, the following two
-         * assertions should be a pretty bulletproof check that we're
-         * writing out packets in the correct sequence.
+         * Continue where we left off
          */
-
-        /* If this is the first packet in a sequence, then it
-         * had better correspond to a keyframe
+        start_pos = find_packet(buffer, frame_serial);
+    } else {
+        int key_pos;
+        int64_t key_serial;
+        /*
+         * We are being asked to write a stream segment that is not
+         * continuous with the last one written out
          */
-        assert(ffmpeg->passthru_last_serial >= 0 ||
-               p->flags & AV_PKT_FLAG_KEY);
+        key_pos = find_key_packet(buffer, frame_serial, ffmpeg->video_stream_index);
+        assert(key_pos >= 0);
 
-        /* If this is NOT the first packet in a sequence, then
-         * it had better be the successor of the previous one
+        key_serial = buffer->array[key_pos].pos;
+
+        if (key_serial <= ffmpeg->passthru_last_serial) {
+            /*
+             * We are still in the same GOP as the last frame written out,
+             * so we can just pick up where we left off, filling in the gap
+             */
+fprintf(stderr, "ffmpeg_put_packets: filling gap from ser=%ld\n", ffmpeg->passthru_last_serial + 1);
+            start_pos = find_packet(buffer, ffmpeg->passthru_last_serial + 1);
+        } else {
+            /*
+             * We are no longer in the same GOP as the last frame written
+             * out, so we start writing frames/packets from the beginning
+             * of the current GOP. The movie will have a gap.
+             */
+fprintf(stderr, "ffmpeg_put_packets: starting GOP from ser=%ld\n", key_serial);
+            start_pos = key_pos;
+        }
+    }
+
+    assert(start_pos >= 0);
+    start_pkt = &buffer->array[start_pos];
+
+    assert(start_pkt->pos > ffmpeg->passthru_last_serial);
+
+    if (start_pkt->pos != ffmpeg->passthru_last_serial + 1 &&
+        ffmpeg->last_pts != AV_NOPTS_VALUE) {
+        /*
+         * There will be a gap (time discontinuity) in the output file. We
+         * need to calculate a timestamp offset for the packets we are
+         * about to write, because any big jumps in the presentation
+         * timestamps will result in long, awkward pauses when watching the
+         * movie file.
          */
-        assert(ffmpeg->passthru_last_serial < 0 ||
-               p->pos == ffmpeg->passthru_last_serial + 1);
+        AVStream *st = ffmpeg->oc->streams[ffmpeg->video_stream_index];
+        int64_t offset_pts  = ffmpeg->last_pts - start_pkt->pts;
+        int64_t offset_usec = av_rescale_q(offset_pts, st->time_base, AV_TIME_BASE_Q);
+        offset_usec += AV_TIME_BASE / 10;  /* 100 ms  FIXME: make dynamic */
+        ffmpeg->passthru_ts_offset = offset_usec;
+    }
 
-        ffmpeg->passthru_last_serial = p->pos;
+    end_pos = start_pos + packet_count;
+    assert(end_pos <= buffer->count);
+
+    for (i = start_pos; i < end_pos; i++) {
+        AVPacket *pkt = &buffer->array[i];
+        AVPacket  pkt_copy;
+        AVStream *st = ffmpeg->oc->streams[pkt->stream_index];
+        int64_t pkt_pts;
 
         /* av_interleaved_write_frame() frees the packet that it writes,
          * and we don't want that, because we might end up needing to
          * write out the same packet again later. So we make a copy.
          */
-        av_init_packet(&p_copy);
-        retcd = av_packet_ref(&p_copy, p);
+        av_init_packet(&pkt_copy);
+        retcd = av_packet_ref(&pkt_copy, pkt);
         if (retcd < 0) break;
 
         if (ffmpeg->passthru_ts_offset != 0) {
@@ -1190,18 +1369,64 @@ fprintf(stderr, "packet: n=%d pts=%09ld ser=%06ld [%c] OUT /\n",
              * feature because the offset is applied _after_ checking
              * that the timestamps are monotonically increasing)
              */
-            int64_t offset = av_rescale_q(ffmpeg->passthru_ts_offset, AV_TIME_BASE_Q, ost->time_base);
-            p_copy.dts += offset;
-            p_copy.pts += offset;
+            int64_t offset = av_rescale_q(ffmpeg->passthru_ts_offset, AV_TIME_BASE_Q, st->time_base);
+            pkt_copy.dts += offset;
+            pkt_copy.pts += offset;
         }
+#if 1
+fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] OUT\n",
+  pkt_copy.stream_index,
+  pkt_copy.pts,
+  (int)pkt_copy.duration,
+  pkt_copy.pos,
+  pkt_copy.flags & AV_PKT_FLAG_KEY ? 'K' : ' ');
+#endif
 
-        p_copy.pos = -1;  /* output byte position is not (yet) known */
+#if 0
+#ifndef NDEBUG
+        /*
+         * Verify that the packet presentation timestamp is a small
+         * positive increment from the previous one in the stream
+         * (exceptions: subtitle packets, and start of stream)
+         *
+         * Note that this check will break if there is a large gap in
+         * the timestamps in the source stream, so in practice it
+         * should only be enabled with a local camera.
+         */
+        if (pkt->stream_index != ffmpeg->subtitle_stream_index) {
+            AVStream *st = ffmpeg->oc->streams[pkt_copy.stream_index];
+            int64_t end_pts    = av_stream_get_end_pts(st);
+            int64_t delta_pts  = pkt_copy.pts - end_pts;
+            int64_t delta_usec = av_rescale_q(delta_pts, st->time_base, AV_TIME_BASE_Q);
+            if (end_pts != 0) {
+                assert(delta_usec > 0);
+                assert(delta_usec < 500000);  /* 0.5 sec */
+            }
+        }
+#endif /* !NDEBUG */
+#endif /* 0 */
 
-        retcd = av_interleaved_write_frame(ffmpeg->oc, &p_copy);
+        /* Clear our serial number from the packet. This is the correct
+         * value to give to FFmpeg, because the output byte position is
+         * not (yet) known
+         */
+        pkt_copy.pos = -1;
+
+        /* This datum will be lost if we don't save it
+         */
+        pkt_pts = pkt_copy.pts;
+
+        retcd = av_interleaved_write_frame(ffmpeg->oc, &pkt_copy);
 #if 1
 assert(retcd == 0); /* XXX: for validation only */
 #endif
         if (retcd < 0) break;
+
+        if (pkt->pos >= 0)
+            ffmpeg->passthru_last_serial = pkt->pos;
+
+        if (pkt->stream_index == ffmpeg->video_stream_index)
+            ffmpeg->last_pts = pkt_pts;
     }
 
     return retcd;
@@ -1212,3 +1437,94 @@ assert(retcd == 0); /* XXX: for validation only */
     return 0;
 #endif
 }
+
+#ifdef HAVE_FFMPEG
+
+/* Unref (free) any packets at the start of the buffer that are no longer
+ * needed, and shift the remaining packets up to take their place. The
+ * packets that are "needed" begin at the first "key" packet at or before
+ * 'keep_serial' that has the specified 'stream_index'.
+ *
+ * (The intent is that 'keep_serial' represents the oldest video frame
+ * that we want to keep in the buffer. We need to retain the associated
+ * key frame, but then everything before that can be discarded.)
+ */
+int ffmpeg_packet_buffer_prune(struct packet_buff *buffer, int64_t keep_serial, int stream_index)
+{
+    int key_pos;
+    int i;
+
+    key_pos = find_key_packet(buffer, keep_serial, stream_index);
+    if (key_pos <= 0)
+        return key_pos;
+
+    for (i = 0; i < key_pos; i++)
+        av_packet_unref(&buffer->array[i]);
+
+    buffer->count -= key_pos;
+    memmove(buffer->array, &buffer->array[key_pos], buffer->count * sizeof(*buffer->array));
+
+    return 0;
+}
+
+int ffmpeg_encode_subtitle(struct ffmpeg *ffmpeg, struct packet_buff *buffer, uint8_t *image_sub, int64_t pts)
+{
+    AVPacket packet;
+    int retcd, size;
+    uint8_t buf[1048576]; /* FIXME: use proper heap buffer */
+
+    if (!ffmpeg->rtsp_format_context)
+        return 0;
+
+#if 1 /* XXX: TEMPORARY CODE TO GENERATE TEST PATTERN */
+{
+    int x, y, k;
+
+    k = buffer->count;  /* derp */
+
+    memset(image_sub, 0, ffmpeg->width * ffmpeg->height);
+
+    for (y = 0; y < 100; y++) {
+        int y_base = y * ffmpeg->width;
+        int y_on = (y + k) & 8;
+        for (x = 0; x < 100; x++) {
+            int x_on = (x + k) & 8;
+            if (x_on != y_on)
+                image_sub[y_base + x] = 2;
+        }
+    }
+}
+#endif /* XXX: TEMPORARY */
+
+#if (LIBAVFORMAT_VERSION_MAJOR < 57)
+# define data pict.data
+#endif
+
+    ffmpeg->subtitle.rects[0]->data[0] = image_sub;
+
+#undef data
+
+    retcd = avcodec_encode_subtitle(ffmpeg->ctx_codec, buf, sizeof(buf), &ffmpeg->subtitle);
+    if (retcd < 0) goto fail;
+    size = retcd;
+
+/* TODO: get rid of this allocation! */
+    retcd = av_new_packet(&packet, size);
+    if (retcd < 0) goto fail;
+    memcpy(packet.data, buf, size);
+
+    packet.flags = AV_PKT_FLAG_KEY;
+    packet.stream_index = ffmpeg->subtitle_stream_index;
+    packet.pos = -1;
+    packet.dts = packet.pts = pts;
+
+    ffmpeg_packet_buffer_add(buffer, &packet);
+
+    return 0;
+
+    fail:
+    MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Failed to encode subtitle frame");
+    return retcd;
+}
+
+#endif /* HAVE_FFMPEG */

@@ -243,7 +243,9 @@ static int netcam_init_jpeg(netcam_context_ptr netcam, j_decompress_ptr cinfo)
     pthread_mutex_lock(&netcam->mutex);
 
     if (netcam->imgcnt_last == netcam->imgcnt) {    /* Need to wait */
+#if 0 /* XXX: see below */
         struct timespec waittime;
+#endif
         struct timeval curtime;
         int retcode;
 
@@ -262,6 +264,7 @@ static int netcam_init_jpeg(netcam_context_ptr netcam, j_decompress_ptr cinfo)
             curtime.tv_sec++;
         }
 
+#if 0 /* FIXME: update to use netcam->barrier ? */
         waittime.tv_sec = curtime.tv_sec;
         waittime.tv_nsec = 1000L * curtime.tv_usec;
 
@@ -269,6 +272,8 @@ static int netcam_init_jpeg(netcam_context_ptr netcam, j_decompress_ptr cinfo)
             retcode = pthread_cond_timedwait(&netcam->pic_ready,
                                              &netcam->mutex, &waittime);
         } while (retcode == EINTR);
+#endif /* 0 */
+retcode=0; /* silence compiler warning */
 
         if (retcode) {    /* We assume a non-zero reply is ETIMEOUT */
             pthread_mutex_unlock(&netcam->mutex);
