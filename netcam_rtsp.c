@@ -214,9 +214,6 @@ static int netcam_open_codec(netcam_context_ptr netcam){
     netcam->rtsp->video_stream_index = retcd;
     st = netcam->rtsp->format_context->streams[netcam->rtsp->video_stream_index];
 
-    /* Passthru mode needs this */
-    netcam->cnt->video_stream_index = retcd;
-
 #if (LIBAVFORMAT_VERSION_MAJOR >= 58) || ((LIBAVFORMAT_VERSION_MAJOR == 57) && (LIBAVFORMAT_VERSION_MINOR >= 41))
     decoder = avcodec_find_decoder(st->codecpar->codec_id);
     if (decoder == NULL) {
@@ -378,11 +375,11 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
     /* Point to our working buffer. */
     buffer = netcam->receiving;
     buffer->used = 0;
-    buffer->serial = netcam->rtsp->packet_serial;
+    buffer->packet_serial = netcam->rtsp->cur_packet_serial;
     buffer->packet_count = 0;
     buffer->pts = AV_NOPTS_VALUE;
 
-    ffmpeg_packet_buffer_unref(buffer->frame_packets);
+    assert(ffmpeg_packet_buffer_count(buffer->frame_packets) == 0);
 
     av_init_packet(&packet);
     packet.data = NULL;
@@ -405,7 +402,7 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
 
         /* Re-purpose the .pos field to store a packet serial number
          */
-        packet.pos = netcam->rtsp->packet_serial++;
+        packet.pos = netcam->rtsp->cur_packet_serial++;
 #if 1
 fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] IN\n",
   packet.stream_index,
@@ -469,6 +466,14 @@ fprintf(stderr, " frame: pts=%09ld pkt_dts=%09ld count=%d type=%c [%c]\n",
   buffer->packet_count,
   av_get_picture_type_char(netcam->rtsp->frame->pict_type),
   netcam->rtsp->frame->key_frame ? 'K' : ' ');
+#endif
+
+    /* Add placeholder packet for subtitle overlay
+     */
+#if 0
+    av_init_packet(&packet);
+    packet.pos = -1;
+    ffmpeg_packet_buffer_add(buffer->frame_packets, &packet);
 #endif
 
     if ((netcam->width  != (unsigned)netcam->rtsp->codec_context->width) ||
@@ -575,17 +580,13 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
         return -1;
     }
 
-    netcam->rtsp->packet_serial = 0;
+    netcam->rtsp->cur_packet_serial = 0;
 
     // open the network connection
     AVDictionary *opts = 0;
     netcam->rtsp->format_context = avformat_alloc_context();
     netcam->rtsp->format_context->interrupt_callback.callback = netcam_interrupt_rtsp;
     netcam->rtsp->format_context->interrupt_callback.opaque = netcam;
-
-    /* Passthru mode needs these */
-    netcam->cnt->rtsp_format_context = netcam->rtsp->format_context;
-    netcam->cnt->video_stream_index  = netcam->rtsp->video_stream_index;
 
     netcam->rtsp->interrupted = 0;
     if (gettimeofday(&netcam->rtsp->startreadtime, NULL) < 0) {
@@ -687,6 +688,11 @@ static int netcam_rtsp_open_context(netcam_context_ptr netcam){
         netcam_rtsp_close_context(netcam);
         return -1;
     }
+
+    /* Save information needed for passthru mode
+     */
+    if (netcam->rtsp->rtsp_info == NULL)
+        netcam->rtsp->rtsp_info = ffmpeg_rtsp_info_new(netcam->rtsp->format_context, netcam->rtsp->video_stream_index);
 
     assert(netcam->rtsp->codec_context != NULL);
 
@@ -932,6 +938,11 @@ int netcam_connect_rtsp(netcam_context_ptr netcam){
     if (netcam_read_rtsp_image(netcam) < 0) return -1;
 #endif /* 0 */
 
+    /* Ensure that both of these are empty
+     */
+    ffmpeg_packet_buffer_unref(netcam->latest->frame_packets);
+    ffmpeg_packet_buffer_unref(netcam->receiving->frame_packets);
+
     netcam->rtsp->status = RTSP_CONNECTED;
 
     MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO, "%s: Camera connected");
@@ -972,6 +983,8 @@ void netcam_shutdown_rtsp(netcam_context_ptr netcam){
     free(netcam->rtsp->path);
     free(netcam->rtsp->user);
     free(netcam->rtsp->pass);
+
+    /* Note: Motion main-loop will free netcam->rtsp->rtsp_info */
 
     free(netcam->rtsp);
     netcam->rtsp = NULL;
@@ -1152,11 +1165,16 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
     memcpy(image, netcam->latest->ptr, netcam->latest->used);
 
 #ifdef HAVE_FFMPEG
-    ffmpeg_packet_buffer_move(netcam->cnt->recent_packets, netcam->latest->frame_packets);
+
+    ffmpeg_packet_buffer_move(netcam->cnt->recent_packets, netcam->new_packets);
+    if (netcam->cnt->rtsp_info == NULL)
+        netcam->cnt->rtsp_info = netcam->rtsp->rtsp_info;
+
     assert(image == netcam->cnt->current_image->image);
-    netcam->cnt->current_image->serial       = netcam->latest->serial;
-    netcam->cnt->current_image->packet_count = netcam->latest->packet_count;
-    if (netcam->latest->serial < netcam->cnt->last_serial) {
+    netcam->cnt->current_image->packet_serial = netcam->latest->packet_serial;
+    netcam->cnt->current_image->packet_count  = netcam->latest->packet_count;
+
+    if (netcam->latest->packet_serial < netcam->cnt->last_packet_serial) {
         /*
          * Stream has restarted! Finish writing any open movie file
          */
@@ -1171,8 +1189,10 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
          */
         netcam->cnt->startup_frames = MAXVAL(netcam->cnt->init_startup_frames, 100);
     }
-    netcam->cnt->last_serial = netcam->latest->serial;
-    netcam->cnt->last_pts    = netcam->latest->pts;
+
+    netcam->cnt->last_packet_serial = netcam->latest->packet_serial;
+    netcam->cnt->last_pts           = netcam->latest->pts;
+
 #endif /* HAVE_FFMPEG */
 
     pthread_mutex_unlock(&netcam->mutex);

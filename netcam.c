@@ -1076,6 +1076,8 @@ void netcam_image_read_complete(netcam_context_ptr netcam)
     netcam->receiving = xchg;
     netcam->imgcnt++;
 
+    ffmpeg_packet_buffer_move(netcam->new_packets, netcam->latest->frame_packets);
+
     pthread_mutex_unlock(&netcam->mutex);
 }
 
@@ -2477,6 +2479,9 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
 
     free(netcam->response);
 
+    if (netcam->new_packets)
+        ffmpeg_packet_buffer_free(netcam->new_packets);
+
     if (netcam->caps.streaming == NCS_RTSP)
         netcam_shutdown_rtsp(netcam);
 
@@ -2601,6 +2606,7 @@ int netcam_start(struct context *cnt)
 #ifdef HAVE_FFMPEG
     netcam->receiving->frame_packets = ffmpeg_packet_buffer_new();
     netcam->latest->frame_packets    = ffmpeg_packet_buffer_new();
+    netcam->new_packets              = ffmpeg_packet_buffer_new();
 #endif
 
     /* Thread control structures */

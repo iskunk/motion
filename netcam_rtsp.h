@@ -21,7 +21,7 @@ struct rtsp_context {
     int                   swsframe_size;
     int                   video_stream_index;
     int64_t               last_dts[MAX_STREAMS];
-    int64_t               packet_serial;
+    int64_t               cur_packet_serial;
     char*                 path;
     char*                 user;
     char*                 pass;
@@ -32,6 +32,8 @@ struct rtsp_context {
     struct timeval        startreadtime;
     struct SwsContext*    swsctx;
     uint8_t*              resize_buffer;
+
+    struct ffmpeg_rtsp_info* rtsp_info;
 };
 
 #else /* Do not have FFmpeg */

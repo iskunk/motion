@@ -750,20 +750,7 @@ static void event_ffmpeg_newfile(struct context *cnt,
 
 #ifdef HAVE_FFMPEG
         if (!strcmp(codec, "passthru")) {
-            AVStream *st;
-            /*
-             * XXX: lock needed here? (note that our access to
-             * rtsp_format_context is read-only and we only need
-             * it to be valid during movie setup)
-             */
-            cnt->ffmpeg_output->rtsp_format_context = (AVFormatContext *)cnt->rtsp_format_context;
-            cnt->ffmpeg_output->video_stream_index = cnt->video_stream_index;
-            st = cnt->ffmpeg_output->rtsp_format_context->streams[cnt->video_stream_index];
-#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
-            cnt->ffmpeg_output->passthru_codec_id = st->codecpar->codec_id;
-#else
-            cnt->ffmpeg_output->passthru_codec_id = st->codec->codec_id;
-#endif
+            cnt->ffmpeg_output->rtsp_info = cnt->rtsp_info;
             cnt->ffmpeg_output->passthru_last_serial = -1;
             cnt->ffmpeg_output->last_pts = AV_NOPTS_VALUE;
         }
@@ -897,12 +884,12 @@ static void event_ffmpeg_put(struct context *cnt,
 
     if (cnt->ffmpeg_output) {
 #ifdef HAVE_FFMPEG
-        if (cnt->ffmpeg_output->rtsp_format_context) {
+        if (cnt->ffmpeg_output->rtsp_info) {
             /*
              * Passthru mode
              */
             ffmpeg_put_packets(cnt->ffmpeg_output, cnt->recent_packets,
-                imgdata->serial, imgdata->packet_count);
+                imgdata->packet_serial, imgdata->packet_count);
         } else
 #endif /* HAVE_FFMPEG */
         if (ffmpeg_put_image(cnt->ffmpeg_output, img, currenttime_tv) == -1) {

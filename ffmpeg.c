@@ -72,6 +72,22 @@
 
 #endif
 
+struct ffmpeg_rtsp_info {
+    int nb_streams;
+    struct ffmpeg_rtsp_info_stream {
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
+        AVCodecParameters *codecpar;
+#else
+        AVCodecContext *codec;
+#endif
+        AVRational time_base;
+        int        disposition;
+        AVRational sample_aspect_ratio;
+        AVRational avg_frame_rate;
+    } streams[MAX_STREAMS];
+    int video_stream_index;
+};
+
 struct packet_buff {
     AVPacket *array;
     int       count;
@@ -836,7 +852,58 @@ static int ffmpeg_put_frame(struct ffmpeg *ffmpeg, const struct timeval *tv1){
         return -1;
     }
     return retcd;
+}
 
+struct ffmpeg_rtsp_info *ffmpeg_rtsp_info_new(AVFormatContext *ic, int video_stream_index) {
+
+    struct ffmpeg_rtsp_info *rtsp_info = mymalloc(sizeof(struct ffmpeg_rtsp_info));
+    int i;
+
+    rtsp_info->nb_streams = ic->nb_streams;
+
+    for (i = 0; i < ic->nb_streams; i++) {
+        AVStream *ist = ic->streams[i];
+        struct ffmpeg_rtsp_info_stream *xst = &rtsp_info->streams[i];
+        int retcd = AVERROR(ENOMEM);
+
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
+        xst->codecpar = avcodec_parameters_alloc();
+        if (xst->codecpar != NULL)
+            retcd = avcodec_parameters_copy(xst->codecpar, ist->codecpar);
+#else
+        xst->codec = avcodec_alloc_context3(NULL);
+        if (xst->codec != NULL)
+            retcd = avcodec_copy_context(xst->codec, ist->codec);
+#endif
+        if (retcd < 0) {
+            MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Error copying RTSP info");
+            return NULL;
+        }
+
+        xst->time_base           = ist->time_base;
+        xst->disposition         = ist->disposition;
+        xst->sample_aspect_ratio = ist->sample_aspect_ratio;
+        xst->avg_frame_rate      = ist->avg_frame_rate;
+    }
+
+    rtsp_info->video_stream_index = video_stream_index;
+
+    return rtsp_info;
+}
+
+void ffmpeg_rtsp_info_free(struct ffmpeg_rtsp_info *rtsp_info) {
+    int i;
+
+    for (i = 0; i < rtsp_info->nb_streams; i++) {
+        struct ffmpeg_rtsp_info_stream *xst = &rtsp_info->streams[i];
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
+        avcodec_parameters_free(&xst->codecpar);
+#else
+        avcodec_free_context(&xst->codec);
+#endif
+    }
+
+    free(rtsp_info);
 }
 
 /* Create a new, empty packet buffer
@@ -993,10 +1060,18 @@ void ffmpeg_global_deinit(void) {
 
 #ifdef HAVE_FFMPEG
 static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
+    int codec_id;
     int retcd;
     int i;
 
-    switch (ffmpeg->passthru_codec_id) {
+    i = ffmpeg->rtsp_info->video_stream_index;
+#if (LIBAVFORMAT_VERSION_MAJOR >= 57)
+    codec_id = ffmpeg->rtsp_info->streams[i].codecpar->codec_id;
+#else
+    codec_id = ffmpeg->rtsp_info->streams[i].codec->codec_id;
+#endif
+
+    switch (codec_id) {
         case MY_CODEC_ID_H264:
         case MY_CODEC_ID_HEVC:
         case MY_CODEC_ID_MJPEG:
@@ -1039,12 +1114,12 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
      * Following is cribbed from the FFmpeg remuxing.c example
      */
 
-    for (i = 0; i < ffmpeg->rtsp_format_context->nb_streams; i++) {
-        AVStream *ist = ffmpeg->rtsp_format_context->streams[i];
+    for (i = 0; i < ffmpeg->rtsp_info->nb_streams; i++) {
+        struct ffmpeg_rtsp_info_stream *xst = &ffmpeg->rtsp_info->streams[i];
 #if (LIBAVFORMAT_VERSION_MAJOR >= 57)
         AVStream *ost = avformat_new_stream(ffmpeg->oc, NULL);
 #else
-        AVStream *ost = avformat_new_stream(ffmpeg->oc, ist->codec->codec);
+        AVStream *ost = avformat_new_stream(ffmpeg->oc, xst->codec->codec);
 #endif
         if (!ost) {
             MOTION_LOG(ERR, TYPE_STREAM, NO_ERRNO, "%s: Could not allocate output stream");
@@ -1052,12 +1127,10 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
             return -1;
         }
 
-        assert(ost->index == ist->index);
-
 #if (LIBAVFORMAT_VERSION_MAJOR >= 57)
-        retcd = avcodec_parameters_copy(ost->codecpar, ist->codecpar);
+        retcd = avcodec_parameters_copy(ost->codecpar, xst->codecpar);
 #else
-        retcd = avcodec_copy_context(ost->codec, ist->codec);
+        retcd = avcodec_copy_context(ost->codec, xst->codec);
 #endif
         if (retcd < 0) {
             MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: Failed to copy stream codec parameters");
@@ -1074,10 +1147,10 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
             ost->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 #endif
 
-        ost->avg_frame_rate      = ist->avg_frame_rate;
-        ost->disposition         = ist->disposition;
-        ost->sample_aspect_ratio = ist->sample_aspect_ratio;
-        ost->time_base           = ist->time_base;
+        ost->time_base           = xst->time_base;
+        ost->disposition         = xst->disposition;
+        ost->sample_aspect_ratio = xst->sample_aspect_ratio;
+        ost->avg_frame_rate      = xst->avg_frame_rate;
     }
 
     retcd = ffmpeg_set_subtitle(ffmpeg);
@@ -1095,13 +1168,13 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
     }
 
 #ifndef NDEBUG
-    for (i = 0; i < ffmpeg->rtsp_format_context->nb_streams; i++) {
-        AVStream *ist = ffmpeg->rtsp_format_context->streams[i];
+    for (i = 0; i < ffmpeg->rtsp_info->nb_streams; i++) {
+        struct ffmpeg_rtsp_info_stream *xst = &ffmpeg->rtsp_info->streams[i];
         AVStream *ost = ffmpeg->oc->streams[i];
 
         /* Input and output streams have equal time bases, right?
          */
-        assert(!av_cmp_q(ist->time_base, ost->time_base));
+        assert(!av_cmp_q(xst->time_base, ost->time_base));
     }
 #endif /* !NDEBUG */
 
@@ -1122,7 +1195,7 @@ int ffmpeg_open(struct ffmpeg *ffmpeg){
         return -1;
     }
 
-    if (ffmpeg->rtsp_format_context) return ffmpeg_open_passthru(ffmpeg);
+    if (ffmpeg->rtsp_info) return ffmpeg_open_passthru(ffmpeg);
 
     retcd = ffmpeg_get_oformat(ffmpeg);
     if (retcd < 0 ) {
@@ -1275,41 +1348,42 @@ static int find_key_packet(struct packet_buff *buffer, int64_t serial, int strea
     return key_pos;
 }
 
-int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_t frame_serial, int packet_count) {
+int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_t packet_serial, int packet_count) {
 #ifdef HAVE_FFMPEG
 
     AVPacket *start_pkt;
-    int start_pos = -1, end_pos;
+    int start_pos, end_pos;
     int retcd = 0;
     int i;
 
     assert(buffer->count > 0);
-    assert(frame_serial >= buffer->array[0].pos);
-    assert(frame_serial > ffmpeg->passthru_last_serial);
+    assert(packet_serial >= buffer->array[0].pos);
+    assert(packet_serial > ffmpeg->passthru_last_serial);
 
-    if (frame_serial == ffmpeg->passthru_last_serial + 1) {
-        /*
-         * Continue where we left off
-         */
-        start_pos = find_packet(buffer, frame_serial);
-    } else {
+    /* Common case
+     */
+    start_pos = find_packet(buffer, packet_serial);
+    end_pos = start_pos + packet_count;
+    assert(end_pos <= buffer->count);
+
+    if (packet_serial != ffmpeg->passthru_last_serial + 1) {
         int key_pos;
-        int64_t key_serial;
+        int64_t key_packet_serial;
         /*
          * We are being asked to write a stream segment that is not
          * continuous with the last one written out
          */
-        key_pos = find_key_packet(buffer, frame_serial, ffmpeg->video_stream_index);
+        key_pos = find_key_packet(buffer, packet_serial, ffmpeg->rtsp_info->video_stream_index);
         assert(key_pos >= 0);
 
-        key_serial = buffer->array[key_pos].pos;
+        key_packet_serial = buffer->array[key_pos].pos;
 
-        if (key_serial <= ffmpeg->passthru_last_serial) {
+        if (key_packet_serial <= ffmpeg->passthru_last_serial) {
             /*
              * We are still in the same GOP as the last frame written out,
              * so we can just pick up where we left off, filling in the gap
              */
-fprintf(stderr, "ffmpeg_put_packets: filling gap from ser=%ld\n", ffmpeg->passthru_last_serial + 1);
+fprintf(stderr, "ffmpeg_put_packets(%ld): filling gap from ser=%ld\n", packet_serial, ffmpeg->passthru_last_serial + 1);
             start_pos = find_packet(buffer, ffmpeg->passthru_last_serial + 1);
         } else {
             /*
@@ -1317,7 +1391,7 @@ fprintf(stderr, "ffmpeg_put_packets: filling gap from ser=%ld\n", ffmpeg->passth
              * out, so we start writing frames/packets from the beginning
              * of the current GOP. The movie will have a gap.
              */
-fprintf(stderr, "ffmpeg_put_packets: starting GOP from ser=%ld\n", key_serial);
+fprintf(stderr, "ffmpeg_put_packets(%ld): starting GOP from ser=%ld\n", packet_serial, key_packet_serial);
             start_pos = key_pos;
         }
     }
@@ -1336,15 +1410,12 @@ fprintf(stderr, "ffmpeg_put_packets: starting GOP from ser=%ld\n", key_serial);
          * timestamps will result in long, awkward pauses when watching the
          * movie file.
          */
-        AVStream *st = ffmpeg->oc->streams[ffmpeg->video_stream_index];
+        AVStream *st = ffmpeg->oc->streams[ffmpeg->rtsp_info->video_stream_index];
         int64_t offset_pts  = ffmpeg->last_pts - start_pkt->pts;
         int64_t offset_usec = av_rescale_q(offset_pts, st->time_base, AV_TIME_BASE_Q);
         offset_usec += AV_TIME_BASE / 10;  /* 100 ms  FIXME: make dynamic */
         ffmpeg->passthru_ts_offset = offset_usec;
     }
-
-    end_pos = start_pos + packet_count;
-    assert(end_pos <= buffer->count);
 
     for (i = start_pos; i < end_pos; i++) {
         AVPacket *pkt = &buffer->array[i];
@@ -1352,9 +1423,9 @@ fprintf(stderr, "ffmpeg_put_packets: starting GOP from ser=%ld\n", key_serial);
         AVStream *st = ffmpeg->oc->streams[pkt->stream_index];
         int64_t pkt_pts;
 
-        /* av_interleaved_write_frame() frees the packet that it writes,
-         * and we don't want that, because we might end up needing to
-         * write out the same packet again later. So we make a copy.
+        /* av_interleaved_write_frame() frees the packet that it writes.
+         * Because we are memory-managing the packet buffers ourselves,
+         * we make a copy for the function to consume.
          */
         av_init_packet(&pkt_copy);
         retcd = av_packet_ref(&pkt_copy, pkt);
@@ -1425,7 +1496,7 @@ assert(retcd == 0); /* XXX: for validation only */
         if (pkt->pos >= 0)
             ffmpeg->passthru_last_serial = pkt->pos;
 
-        if (pkt->stream_index == ffmpeg->video_stream_index)
+        if (pkt->stream_index == ffmpeg->rtsp_info->video_stream_index)
             ffmpeg->last_pts = pkt_pts;
     }
 
@@ -1443,18 +1514,18 @@ assert(retcd == 0); /* XXX: for validation only */
 /* Unref (free) any packets at the start of the buffer that are no longer
  * needed, and shift the remaining packets up to take their place. The
  * packets that are "needed" begin at the first "key" packet at or before
- * 'keep_serial' that has the specified 'stream_index'.
+ * 'keep_packet_serial' that has the specified 'stream_index'.
  *
- * (The intent is that 'keep_serial' represents the oldest video frame
- * that we want to keep in the buffer. We need to retain the associated
+ * (The intent is that 'keep_packet_serial' represents the oldest packet
+ * that we want to keep and remain usable. We need to retain the associated
  * key frame, but then everything before that can be discarded.)
  */
-int ffmpeg_packet_buffer_prune(struct packet_buff *buffer, int64_t keep_serial, int stream_index)
+int ffmpeg_packet_buffer_prune(struct packet_buff *buffer, int64_t keep_packet_serial, int stream_index)
 {
     int key_pos;
     int i;
 
-    key_pos = find_key_packet(buffer, keep_serial, stream_index);
+    key_pos = find_key_packet(buffer, keep_packet_serial, stream_index);
     if (key_pos <= 0)
         return key_pos;
 
@@ -1473,7 +1544,7 @@ int ffmpeg_encode_subtitle(struct ffmpeg *ffmpeg, struct packet_buff *buffer, ui
     int retcd, size;
     uint8_t buf[1048576]; /* FIXME: use proper heap buffer */
 
-    if (!ffmpeg->rtsp_format_context)
+    if (ffmpeg->rtsp_info == NULL)
         return 0;
 
 #if 1 /* XXX: TEMPORARY CODE TO GENERATE TEST PATTERN */

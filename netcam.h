@@ -94,7 +94,7 @@ typedef struct netcam_image_buff {
     struct timeval image_time;      /* time this image was received */
 #ifdef HAVE_FFMPEG
     struct packet_buff *frame_packets;
-    int64_t serial;
+    int64_t packet_serial;
     int packet_count;
     int64_t pts;
 #endif
@@ -261,6 +261,11 @@ typedef struct netcam_context {
 
     int jpeg_error;             /* flag to show error or warning
                                    occurred during decompression*/
+
+#ifdef HAVE_FFMPEG
+    struct packet_buff *new_packets; /* packets ready to be transferred
+                                        to the motion main-loop */
+#endif
 } netcam_context;
 
 #define MJPG_MH_MAGIC          "MJPG"

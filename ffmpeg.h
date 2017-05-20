@@ -32,6 +32,8 @@ enum TIMELAPSE_TYPE {
 
 #endif // HAVE_FFMPEG
 
+struct ffmpeg_rtsp_info;
+
 struct ffmpeg {
 #ifdef HAVE_FFMPEG
     AVFormatContext *oc;
@@ -41,7 +43,6 @@ struct ffmpeg {
     AVPacket pkt;
     AVFrame *picture;       /* contains default image pointers */
     AVDictionary *opts;
-    AVFormatContext *rtsp_format_context;
     enum AVCodecID passthru_codec_id;
     AVRational passthru_time_base;
     AVSubtitle subtitle;
@@ -58,9 +59,9 @@ struct ffmpeg {
     int test_mode;
     int gop_cnt;
     struct timeval start_time;
+    struct ffmpeg_rtsp_info *rtsp_info;
     int64_t passthru_last_serial;
     int64_t passthru_ts_offset;
-    int video_stream_index;
     int subtitle_stream_index;
 };
 
@@ -83,8 +84,10 @@ void ffmpeg_packet_buffer_clear(struct packet_buff *buffer);
 void ffmpeg_packet_buffer_unref(struct packet_buff *buffer);
 int  ffmpeg_packet_buffer_count(struct packet_buff *buffer);
 void ffmpeg_packet_buffer_free(struct packet_buff *buffer);
-int  ffmpeg_packet_buffer_prune(struct packet_buff *buffer, int64_t keep_serial, int stream_index);
+int  ffmpeg_packet_buffer_prune(struct packet_buff *buffer, int64_t keep_packet_serial, int stream_index);
 
+struct ffmpeg_rtsp_info *ffmpeg_rtsp_info_new(AVFormatContext *ic, int video_stream_index);
+void ffmpeg_rtsp_info_free(struct ffmpeg_rtsp_info *rtsp_info);
 int ffmpeg_encode_subtitle(struct ffmpeg *ffmpeg, struct packet_buff *buffer, uint8_t *image_sub, int64_t pts);
 
 #endif /* HAVE_FFMPEG */
@@ -95,7 +98,7 @@ void ffmpeg_avcodec_log(void *, int, const char *, va_list);
 
 int ffmpeg_open(struct ffmpeg *ffmpeg);
 int ffmpeg_put_image(struct ffmpeg *ffmpeg, unsigned char *image, const struct timeval *tv1);
-int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_t frame_serial, int packet_count);
+int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_t packet_serial, int packet_count);
 void ffmpeg_close(struct ffmpeg *ffmpeg);
 
 #endif /* _INCLUDE_FFMPEG_H_ */

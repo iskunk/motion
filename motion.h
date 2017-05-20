@@ -272,8 +272,9 @@ struct image_data {
     int total_labels;
 
 #ifdef HAVE_FFMPEG
-    int64_t serial;
+    int64_t packet_serial;
     int packet_count;
+    int64_t frame_serial;
 #endif
 };
 
@@ -479,10 +480,12 @@ struct context {
     char motionfilename[PATH_MAX];
 #ifdef HAVE_FFMPEG
     void *rtsp_format_context;  /* actually an AVFormatContext */
+    struct ffmpeg_rtsp_info *rtsp_info;
     int video_stream_index;
     struct packet_buff *recent_packets;
-    int64_t last_serial;
+    int64_t last_packet_serial;
     int64_t last_pts;
+    int64_t cur_frame_serial;
 #endif
 
     int area_minx[9], area_miny[9], area_maxx[9], area_maxy[9];

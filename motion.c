@@ -908,7 +908,7 @@ static int motion_init(struct context *cnt)
 
 #ifdef HAVE_FFMPEG
     cnt->recent_packets = ffmpeg_packet_buffer_new();
-    cnt->last_serial = -1;
+    cnt->last_packet_serial = -1;
 #endif
 
     /* set the device settings */
@@ -1338,6 +1338,8 @@ static void motion_cleanup(struct context *cnt)
     cnt->imgs.preview_image.image = NULL;
 
 #ifdef HAVE_FFMPEG
+    ffmpeg_rtsp_info_free(cnt->rtsp_info);
+    cnt->rtsp_info = NULL;
     ffmpeg_packet_buffer_free(cnt->recent_packets);
     cnt->recent_packets = NULL;
 #endif
@@ -1578,7 +1580,7 @@ static void mlp_resetimages(struct context *cnt){
 
     /* Get rid of packets we no longer need
      */
-    ffmpeg_packet_buffer_prune(cnt->recent_packets, cnt->current_image->serial, cnt->video_stream_index);
+    ffmpeg_packet_buffer_prune(cnt->recent_packets, cnt->current_image->packet_serial, cnt->video_stream_index);
 
     /* Check that the packet buffer isn't growing without bound
      * (provided the ring buffer is reasonably sized)
@@ -1685,6 +1687,8 @@ static int mlp_capture(struct context *cnt){
             event(cnt, EVENT_CAMERA_FOUND, NULL, NULL, NULL, NULL);
         }
         cnt->missing_frame_counter = 0;
+
+        cnt->current_image->frame_serial = cnt->cur_frame_serial++;
 
         /*
          * Save the newly captured still virgin image to a buffer
