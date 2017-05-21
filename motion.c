@@ -1338,8 +1338,10 @@ static void motion_cleanup(struct context *cnt)
     cnt->imgs.preview_image.image = NULL;
 
 #ifdef HAVE_FFMPEG
-    ffmpeg_rtsp_info_free(cnt->rtsp_info);
-    cnt->rtsp_info = NULL;
+    if (cnt->rtsp_info != NULL) {
+        ffmpeg_rtsp_info_free(cnt->rtsp_info);
+        cnt->rtsp_info = NULL;
+    }
     ffmpeg_packet_buffer_free(cnt->recent_packets);
     cnt->recent_packets = NULL;
 #endif
