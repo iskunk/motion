@@ -2360,10 +2360,13 @@ ssize_t netcam_recv(netcam_context_ptr netcam, void *buffptr, size_t buffsize)
 void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
 {
     struct timespec waittime;
-    int do_barriers = 0;
+    int do_barriers;
 
     if (!netcam)
         return;
+
+    do_barriers = netcam->caps.streaming == NCS_UNSUPPORTED
+        || netcam->caps.streaming == NCS_RTSP;
 
     /*
      * This 'lock' is just a bit of "defensive" programming.  It should
@@ -2384,26 +2387,27 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
      */
     netcam->cnt->netcam = NULL;
 
-    if (netcam->caps.streaming == NCS_UNSUPPORTED ||
-        (netcam->caps.streaming == NCS_RTSP /*&& in_passthru_mode*/)) {
-        do_barriers = 1;
+    /*
+     * If non-streaming, then allow the camera handler to cross the
+     * first synchronization barrier. We unlock the mutex before waiting
+     * in case the handler needs it.
+     */
+    if (do_barriers) {
+        pthread_mutex_unlock(&netcam->mutex);
+        pthread_barrier_wait(&netcam->barrier);
+        pthread_mutex_lock(&netcam->mutex);
     }
 
     /*
      * Next we set 'finish' in order to get the camera-handler thread
      * to stop.
-     *
-     * If applicable, we do this between two synchronization barriers so
-     * that the flag changes state between the two corresponding barriers
-     * in netcam_handler_loop(). (What's important is that the flag
-     * changes state at a known point in the loop, because we can't
-     * otherwise conditionalize whether or not we enter the barriers in
-     * this cleanup routine. (Remember that POSIX barriers have no
-     * provision for timing out, so we need to be very careful here or
-     * else the camera handler will end up stuck in a deadlock.)
      */
-    if (do_barriers) pthread_barrier_wait(&netcam->barrier);
     netcam->finish = 1;
+
+    /*
+     * If non-streaming, then allow the camera handler to cross the
+     * second barrier.
+     */
     if (do_barriers) pthread_barrier_wait(&netcam->barrier);
 
     /*
