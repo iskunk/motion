@@ -244,8 +244,10 @@ static int netcam_open_codec(netcam_context_ptr netcam){
 
 #endif
 
-    /* FIXME: seems like this may be desirable for passthru mode
-     * (is it?) but don't set it in non-passthru
+    /* Force low delay in passthru mode, because we need to be able
+     * to tell exactly which packets yield a given frame
+     *
+     * FIXME: set only for passthru mode
      */
     netcam->rtsp->codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
@@ -369,6 +371,7 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
     AVPacket           packet;
     int                size_decoded;
     int                video_packet_count = 0;
+    int64_t            last_video_dts = 0;
 
     assert(netcam->rtsp->codec_context != NULL);
 
@@ -404,8 +407,9 @@ int netcam_read_rtsp_image(netcam_context_ptr netcam){
          */
         packet.pos = netcam->rtsp->cur_packet_serial++;
 #if 1
-fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] IN\n",
+fprintf(stderr, "packet: n=%d dts=%09ld pts=%09ld dur=%05d ser=%06ld [%c] IN\n",
   packet.stream_index,
+  packet.dts,
   packet.pts,
   (int)packet.duration,
   packet.pos,
@@ -436,6 +440,7 @@ fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] IN\n",
 
         if (packet.stream_index == netcam->rtsp->video_stream_index) {
             video_packet_count++;
+            last_video_dts = packet.dts;
             size_decoded = rtsp_decode_packet(&packet, buffer, netcam->rtsp->frame, netcam->rtsp->codec_context);
         }
 
@@ -455,6 +460,12 @@ fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] IN\n",
         netcam_rtsp_close_context(netcam);
         return -1;
     }
+
+    /* Codec delay is undesirable in passthru mode, because it
+     * hampers our ability to correlate packets and frames
+     */
+    assert(video_packet_count == 0 ||
+           netcam->rtsp->frame->pkt_dts == last_video_dts);
 
     buffer->pts = (netcam->rtsp->frame->pts != AV_NOPTS_VALUE) ?
         netcam->rtsp->frame->pts : netcam->rtsp->frame->pkt_dts;

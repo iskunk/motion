@@ -285,6 +285,7 @@ static int ffmpeg_get_oformat(struct ffmpeg *ffmpeg){
         ffmpeg->oc->oformat = av_guess_format ("mpeg2video", NULL, NULL);
         if (ffmpeg->oc->oformat) ffmpeg->oc->oformat->video_codec = MY_CODEC_ID_MPEG2VIDEO;
         strncat(ffmpeg->filename, ".mpg", 4);
+/* XXX: isn't this next bit redundant w.r.t. check code at end of function? */
         if (!ffmpeg->oc->oformat) {
             MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, "%s: ffmpeg_video_codec option value %s is not supported", ffmpeg->codec_name);
             ffmpeg_free_context(ffmpeg);
@@ -342,6 +343,12 @@ static int ffmpeg_get_oformat(struct ffmpeg *ffmpeg){
         ffmpeg->oc->oformat = av_guess_format("mp4", NULL, NULL);
         strncat(ffmpeg->filename, ".mp4", 4);
         if (ffmpeg->oc->oformat) ffmpeg->oc->oformat->video_codec = MY_CODEC_ID_HEVC;
+    }
+
+    if (strcmp(ffmpeg->codec_name, "mpeg2video") == 0) {
+        ffmpeg->oc->oformat = av_guess_format("mpegts", NULL, NULL);
+        if (ffmpeg->oc->oformat) ffmpeg->oc->oformat->video_codec = MY_CODEC_ID_MPEG2VIDEO;
+        strncat(ffmpeg->filename, ".ts", 4);
     }
 
     //Check for valid results
@@ -1079,6 +1086,10 @@ static int ffmpeg_open_passthru(struct ffmpeg *ffmpeg) {
         ffmpeg->codec_name = "mp4";
         break;
 
+        case MY_CODEC_ID_MPEG2VIDEO:
+        ffmpeg->codec_name = "mpeg2video";
+        break;
+
         /*
          * Note: "mkv" (Matroska) format is not supported for passthru
          * recording as FFmpeg forces it to have a time base of 1/1000
@@ -1423,7 +1434,18 @@ fprintf(stderr, "ffmpeg_put_packets(%ld): starting GOP from ser=%ld\n", packet_s
         AVStream *st = ffmpeg->oc->streams[pkt->stream_index];
         int64_t pkt_pts;
 
-        /* av_interleaved_write_frame() frees the packet that it writes.
+        /*
+         * It is possible to receive packets for streams that were not
+         * initially declared in the input (this has been observed in
+         * experiments feeding DVD video through this pipeline)
+         */
+        if (pkt->pos >= 0 && pkt->stream_index >= ffmpeg->rtsp_info->nb_streams) {
+            MOTION_LOG(INF, TYPE_ENCODER, NO_ERRNO, "%s: Skipping packet from extraneous stream %d", pkt->stream_index);
+            continue;
+        }
+
+        /*
+         * av_interleaved_write_frame() frees the packet that it writes.
          * Because we are memory-managing the packet buffers ourselves,
          * we make a copy for the function to consume.
          */
@@ -1441,8 +1463,10 @@ fprintf(stderr, "ffmpeg_put_packets(%ld): starting GOP from ser=%ld\n", packet_s
              * that the timestamps are monotonically increasing)
              */
             int64_t offset = av_rescale_q(ffmpeg->passthru_ts_offset, AV_TIME_BASE_Q, st->time_base);
-            pkt_copy.dts += offset;
-            pkt_copy.pts += offset;
+            if (pkt_copy.dts != AV_NOPTS_VALUE)
+                pkt_copy.dts += offset;
+            if (pkt_copy.pts != AV_NOPTS_VALUE)
+                pkt_copy.pts += offset;
         }
 #if 1
 fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] OUT\n",
@@ -1485,7 +1509,7 @@ fprintf(stderr, "packet: n=%d pts=%09ld dur=%05d ser=%06ld [%c] OUT\n",
 
         /* This datum will be lost if we don't save it
          */
-        pkt_pts = pkt_copy.pts;
+        pkt_pts = (pkt_copy.pts != AV_NOPTS_VALUE) ? pkt_copy.pts : pkt_copy.dts;
 
         retcd = av_interleaved_write_frame(ffmpeg->oc, &pkt_copy);
 #if 1

@@ -1052,7 +1052,7 @@ static unsigned int action(char *pointer, char *res, unsigned int length_uri,
 
             if (thread == 0) {
                 MOTION_LOG(NTC, TYPE_STREAM, NO_ERRNO, "%s: httpd is going to restart");
-                kill(getpid(),SIGHUP);
+                raise(SIGHUP);
                 if (cnt[0]->conf.webcontrol_html_output) {
                     send_template_ini_client(client_socket, ini_template);
                     sprintf(res, "restart in progress ... bye<br>\n<a href='/'>Home</a>");
@@ -1098,7 +1098,7 @@ static unsigned int action(char *pointer, char *res, unsigned int length_uri,
 
             if (thread == 0) {
                 MOTION_LOG(NTC, TYPE_STREAM, NO_ERRNO, "%s: httpd quits");
-                kill(getpid(),SIGQUIT);
+                raise(SIGQUIT);
                 if (cnt[0]->conf.webcontrol_html_output) {
                     send_template_ini_client(client_socket, ini_template);
                     sprintf(res, "quit in progress ... bye");
