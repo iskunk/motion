@@ -1359,7 +1359,7 @@ static int find_key_packet(struct packet_buff *buffer, int64_t serial, int strea
     return key_pos;
 }
 
-int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_t packet_serial, int packet_count) {
+int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, struct image_data *imgdata) {
 #ifdef HAVE_FFMPEG
 
     AVPacket *start_pkt;
@@ -1368,41 +1368,59 @@ int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_
     int i;
 
     assert(buffer->count > 0);
-    assert(packet_serial >= buffer->array[0].pos);
-    assert(packet_serial > ffmpeg->passthru_last_serial);
+    assert(imgdata->packet_serial >= buffer->array[0].pos);
+    assert(imgdata->packet_serial > ffmpeg->last_packet_serial);
+    assert(imgdata->frame_serial  > ffmpeg->last_frame_serial);
 
     /* Common case
      */
-    start_pos = find_packet(buffer, packet_serial);
-    end_pos = start_pos + packet_count;
+    start_pos = find_packet(buffer, imgdata->packet_serial);
+    end_pos = start_pos + imgdata->packet_count;
     assert(end_pos <= buffer->count);
 
-    if (packet_serial != ffmpeg->passthru_last_serial + 1) {
+    if (imgdata->packet_serial == ffmpeg->last_packet_serial + 1) {
+        /*
+         * We are writing out a frame whose packets immediately follow
+         * those of the last frame written out. This is the common case,
+         * and the easiest one to deal with.
+         */
+    } else if (imgdata->frame_serial == ffmpeg->last_frame_serial + 1) {
+        /*
+         * We are writing out a frame whose predecessor in the motion-loop
+         * was also written, but there are one or more dropped frames in
+         * between. ("Dropped" means that we received the packets for a
+         * frame, but did not have the time to analyze it for motion.)
+         * We need to write out these dropped frames, because as far as
+         * the motion-loop is concerned, there is no gap here.
+         */
+        start_pos = find_packet(buffer, ffmpeg->last_packet_serial + 1);
+    } else {
         int key_pos;
         int64_t key_packet_serial;
         /*
-         * We are being asked to write a stream segment that is not
-         * continuous with the last one written out
+         * We are writing out a frame that is NOT continuous with the
+         * last one written out (i.e. the first frame aftar a gap).
          */
-        key_pos = find_key_packet(buffer, packet_serial, ffmpeg->rtsp_info->video_stream_index);
+        key_pos = find_key_packet(buffer, imgdata->packet_serial, ffmpeg->rtsp_info->video_stream_index);
         assert(key_pos >= 0);
 
         key_packet_serial = buffer->array[key_pos].pos;
 
-        if (key_packet_serial <= ffmpeg->passthru_last_serial) {
+        if (key_packet_serial <= ffmpeg->last_packet_serial) {
             /*
              * We are still in the same GOP as the last frame written out,
-             * so we can just pick up where we left off, filling in the gap
+             * so we can just pick up where we left off. This has the nice
+             * side effect of eliminating the gap altogether.
              */
-fprintf(stderr, "ffmpeg_put_packets(%ld): filling gap from ser=%ld\n", packet_serial, ffmpeg->passthru_last_serial + 1);
-            start_pos = find_packet(buffer, ffmpeg->passthru_last_serial + 1);
+fprintf(stderr, "ffmpeg_put_packets(%ld): filling gap from ser=%ld\n", imgdata->packet_serial, ffmpeg->last_packet_serial + 1);
+            start_pos = find_packet(buffer, ffmpeg->last_packet_serial + 1);
         } else {
             /*
              * We are no longer in the same GOP as the last frame written
              * out, so we start writing frames/packets from the beginning
              * of the current GOP. The movie will have a gap.
              */
-fprintf(stderr, "ffmpeg_put_packets(%ld): starting GOP from ser=%ld\n", packet_serial, key_packet_serial);
+fprintf(stderr, "ffmpeg_put_packets(%ld): starting GOP from ser=%ld\n", imgdata->packet_serial, key_packet_serial);
             start_pos = key_pos;
         }
     }
@@ -1410,9 +1428,9 @@ fprintf(stderr, "ffmpeg_put_packets(%ld): starting GOP from ser=%ld\n", packet_s
     assert(start_pos >= 0);
     start_pkt = &buffer->array[start_pos];
 
-    assert(start_pkt->pos > ffmpeg->passthru_last_serial);
+    assert(start_pkt->pos > ffmpeg->last_packet_serial);
 
-    if (start_pkt->pos != ffmpeg->passthru_last_serial + 1 &&
+    if (start_pkt->pos != ffmpeg->last_packet_serial + 1 &&
         ffmpeg->last_pts != AV_NOPTS_VALUE) {
         /*
          * There will be a gap (time discontinuity) in the output file. We
@@ -1518,11 +1536,13 @@ assert(retcd == 0); /* XXX: for validation only */
         if (retcd < 0) break;
 
         if (pkt->pos >= 0)
-            ffmpeg->passthru_last_serial = pkt->pos;
+            ffmpeg->last_packet_serial = pkt->pos;
 
         if (pkt->stream_index == ffmpeg->rtsp_info->video_stream_index)
             ffmpeg->last_pts = pkt_pts;
     }
+
+    ffmpeg->last_frame_serial = imgdata->frame_serial;
 
     return retcd;
 #else

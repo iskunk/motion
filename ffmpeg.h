@@ -60,7 +60,8 @@ struct ffmpeg {
     int gop_cnt;
     struct timeval start_time;
     struct ffmpeg_rtsp_info *rtsp_info;
-    int64_t passthru_last_serial;
+    int64_t last_frame_serial;
+    int64_t last_packet_serial;
     int64_t passthru_ts_offset;
     int subtitle_stream_index;
 };
@@ -98,7 +99,7 @@ void ffmpeg_avcodec_log(void *, int, const char *, va_list);
 
 int ffmpeg_open(struct ffmpeg *ffmpeg);
 int ffmpeg_put_image(struct ffmpeg *ffmpeg, unsigned char *image, const struct timeval *tv1);
-int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, int64_t packet_serial, int packet_count);
+int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, struct image_data *imgdata);
 void ffmpeg_close(struct ffmpeg *ffmpeg);
 
 #endif /* _INCLUDE_FFMPEG_H_ */

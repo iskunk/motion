@@ -1078,6 +1078,13 @@ void netcam_image_read_complete(netcam_context_ptr netcam)
 
     ffmpeg_packet_buffer_move(netcam->new_packets, netcam->latest->frame_packets);
 
+    /*
+     * We have a new frame ready.  We send a signal so that
+     * any thread (e.g. the motion main loop) waiting for the
+     * next frame to become available may proceed.
+     */
+    netcam->get_picture = 1;
+    pthread_cond_signal(&netcam->pic_ready);
     pthread_mutex_unlock(&netcam->mutex);
 }
 
@@ -1789,8 +1796,7 @@ static void *netcam_handler_loop(void *arg)
      */
 
     while (!netcam->finish) {
-
-        restart:
+        int success = 1;
 
         if (netcam->response) {    /* If html input */
             if (netcam->caps.streaming == NCS_UNSUPPORTED) {
@@ -1815,7 +1821,7 @@ static void *netcam_handler_loop(void *arg)
                         }
                         /* Need to have a dynamic delay here. */
                         SLEEP(5, 0);
-                        goto restart;
+                        success = 0;
                     }
 
                     if (open_error) {          /* Log re-connection */
@@ -1834,7 +1840,7 @@ static void *netcam_handler_loop(void *arg)
                                    retval);
                     }
                     /* Need to have a dynamic delay here. */
-                    goto restart;
+                    success = 0;
                 }
             } else if (netcam->caps.streaming == NCS_MULTIPART) {    /* Multipart Streaming */
                 if (netcam_read_next_header(netcam) < 0) {
@@ -1845,7 +1851,7 @@ static void *netcam_handler_loop(void *arg)
                             open_error = 1;
                         }
                         SLEEP(5, 0);
-                        goto restart;
+                        success = 0;
                     }
 
                     if ((retval = netcam_read_first_header(netcam) != 2)) {
@@ -1858,7 +1864,7 @@ static void *netcam_handler_loop(void *arg)
                                        "%s: Error in header (%d)", retval);
                         }
                         /* FIXME need some limit. */
-                        goto restart;
+                        success = 0;
                     }
                 }
                 if (open_error) {          /* Log re-connection */
@@ -1883,7 +1889,7 @@ static void *netcam_handler_loop(void *arg)
                 }
                 netcam->rtsp->status = RTSP_RECONNECTING;
                 netcam_connect_rtsp(netcam);
-                goto restart;
+                success = 0;
             } else {
                 // We think we are connected...
                 if (netcam->get_image(netcam) < 0) {
@@ -1894,7 +1900,7 @@ static void *netcam_handler_loop(void *arg)
                     //Nope.  We are not or got bad image.  Reconnect
                     netcam->rtsp->status = RTSP_RECONNECTING;
                     netcam_connect_rtsp(netcam);
-                    goto restart;
+                    success = 0;
                 }
             }
         }
@@ -1909,25 +1915,17 @@ static void *netcam_handler_loop(void *arg)
                     if (ftp_connect(netcam) < 0)
                         MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Trying to re-connect");
                 }
-                goto restart;
+                success = 0;
             }
         }
 
         /*
-         * FIXME
-         * Need to check whether the image was received / decoded
-         * satisfactorily.
+         * If non-streaming, want to synchronize our thread with the
+         * motion main-loop.
          */
-
-        /*
-         * If non-streaming, or in passthru mode, then we want to
-         * synchronize our thread with the motion main-loop.
-         */
-
-        if (netcam->caps.streaming == NCS_UNSUPPORTED ||
-            (netcam->caps.streaming == NCS_RTSP /*&& in_passthru_mode*/)) {
-
-            /* First barrier: Wait until the motion-loop is ready to
+        if (success && netcam->caps.streaming == NCS_UNSUPPORTED) {
+            /*
+             * First barrier: Wait until the motion-loop is ready to
              * copy over the image
              */
             pthread_barrier_wait(&netcam->barrier);
@@ -2365,8 +2363,7 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
     if (!netcam)
         return;
 
-    do_barriers = netcam->caps.streaming == NCS_UNSUPPORTED
-        || netcam->caps.streaming == NCS_RTSP;
+    do_barriers = netcam->caps.streaming == NCS_UNSUPPORTED && !init_retry_flag;
 
     /*
      * This 'lock' is just a bit of "defensive" programming.  It should
@@ -2490,6 +2487,7 @@ void netcam_cleanup(netcam_context_ptr netcam, int init_retry_flag)
         netcam_shutdown_rtsp(netcam);
 
     pthread_mutex_destroy(&netcam->mutex);
+    pthread_cond_destroy(&netcam->pic_ready);
     pthread_cond_destroy(&netcam->exiting);
     pthread_barrier_destroy(&netcam->barrier);
     free(netcam);
@@ -2615,6 +2613,7 @@ int netcam_start(struct context *cnt)
 
     /* Thread control structures */
     pthread_mutex_init(&netcam->mutex, NULL);
+    pthread_cond_init(&netcam->pic_ready, NULL);
     pthread_cond_init(&netcam->exiting, NULL);
     pthread_barrier_init(&netcam->barrier, NULL, 2);
 

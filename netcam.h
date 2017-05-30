@@ -147,6 +147,18 @@ typedef struct netcam_context {
                                    the camera-handler acknowledge that
                                    it's finished */
 
+    pthread_cond_t pic_ready;   /* pthread condition structure used
+                                   for synchronisation between the
+                                   camera handler and the motion main
+                                   loop, showing new frame is ready */
+
+    int get_picture;            /* besides our signalling condition,
+                                   we also keep a flag to assure the
+                                   motion-loop will always get a new
+                                   frame as soon as possible, even if
+                                   it's not currently waiting on the
+                                   condition. */
+
     pthread_barrier_t barrier;  /* pthread barrier to keep the camera
                                    handler and motion main loop in sync */
 

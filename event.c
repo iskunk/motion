@@ -751,7 +751,8 @@ static void event_ffmpeg_newfile(struct context *cnt,
 #ifdef HAVE_FFMPEG
         if (!strcmp(codec, "passthru")) {
             cnt->ffmpeg_output->rtsp_info = cnt->rtsp_info;
-            cnt->ffmpeg_output->passthru_last_serial = -1;
+            cnt->ffmpeg_output->last_frame_serial = -1;
+            cnt->ffmpeg_output->last_packet_serial = -1;
             cnt->ffmpeg_output->last_pts = AV_NOPTS_VALUE;
         }
 #endif /* HAVE_FFMPEG */
@@ -888,8 +889,7 @@ static void event_ffmpeg_put(struct context *cnt,
             /*
              * Passthru mode
              */
-            ffmpeg_put_packets(cnt->ffmpeg_output, cnt->recent_packets,
-                imgdata->packet_serial, imgdata->packet_count);
+            ffmpeg_put_packets(cnt->ffmpeg_output, cnt->recent_packets, imgdata);
         } else
 #endif /* HAVE_FFMPEG */
         if (ffmpeg_put_image(cnt->ffmpeg_output, img, currenttime_tv) == -1) {

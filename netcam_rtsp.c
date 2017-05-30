@@ -1167,11 +1167,19 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
      * The netcam mutex *only* protects netcam->latest, it cannot be
      * used to safely call other netcam functions. */
 
-    /* First barrier: Wait for netcam handler to finish reading image
-     */
-    pthread_barrier_wait(&netcam->barrier);
-
     pthread_mutex_lock(&netcam->mutex);
+
+    while (!netcam->get_picture) {
+        struct timespec waittime;
+        waittime.tv_sec  = time(NULL) + 2;
+        waittime.tv_nsec = 0;
+        if (pthread_cond_timedwait(&netcam->pic_ready, &netcam->mutex, &waittime) == 0)
+            break;
+        if (netcam->cnt->finish)
+            goto done;
+    }
+
+    netcam->get_picture = 0;
 
     memcpy(image, netcam->latest->ptr, netcam->latest->used);
 
@@ -1206,11 +1214,9 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
 
 #endif /* HAVE_FFMPEG */
 
-    pthread_mutex_unlock(&netcam->mutex);
+    done:
 
-    /* Second barrier: Allow netcam handler to read next image
-     */
-    pthread_barrier_wait(&netcam->barrier);
+    pthread_mutex_unlock(&netcam->mutex);
 
     if (netcam->cnt->rotate_data.degrees > 0)
         /* Rotate as specified */
