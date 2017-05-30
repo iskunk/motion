@@ -1218,7 +1218,7 @@ int netcam_next_rtsp(unsigned char *image , netcam_context_ptr netcam){
 
     pthread_mutex_unlock(&netcam->mutex);
 
-    if (netcam->cnt->rotate_data.degrees > 0)
+    if (netcam->cnt->rotate_data.degrees > 0 || netcam->cnt->rotate_data.axis != FLIP_TYPE_NONE)
         /* Rotate as specified */
         rotate_map(netcam->cnt, image);
 

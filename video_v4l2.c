@@ -165,7 +165,7 @@ typedef struct {
 /**
  * xioctl
  */
-#ifdef __OpenBSD__
+#if defined (__OpenBSD__) || defined (__FreeBSD__)
 static int xioctl(src_v4l2_t *vid_source, unsigned long request, void *arg)
 #else
 static int xioctl(src_v4l2_t *vid_source, int request, void *arg)
@@ -1386,7 +1386,7 @@ int v4l2_next(struct context *cnt, unsigned char *map)
     }
 
     /* Rotate the image as specified. */
-    if (cnt->rotate_data.degrees > 0)
+    if (cnt->rotate_data.degrees > 0 || cnt->rotate_data.axis != FLIP_TYPE_NONE)
         rotate_map(cnt, map);
 
     return ret;
