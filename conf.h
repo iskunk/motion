@@ -32,6 +32,7 @@ struct config {
     int rotate_deg;
     int max_changes;
     int threshold_tune;
+    char *changes_log_file;
     const char *output_pictures;
     int ffmpeg_duplicate_frames;
     int motion_img;

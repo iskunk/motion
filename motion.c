@@ -1164,6 +1164,29 @@ static int motion_init(struct context *cnt)
     /* Set threshold value */
     cnt->threshold = cnt->conf.max_changes;
 
+    if (cnt->conf.changes_log_file != NULL) {
+        cnt->changes_log = fopen(cnt->conf.changes_log_file, "a");
+        if (cnt->changes_log == NULL) {
+            MOTION_LOG(ERR, TYPE_ALL, SHOW_ERRNO, "%s: Cannot create changes log file %s",
+                       cnt->conf.changes_log_file);
+            cnt->finish = 1;
+        } else {
+            setvbuf(cnt->changes_log, NULL, _IOLBF, 100);
+            if (ftell(cnt->changes_log) == 0) {
+                fputs("# Motion pixel changes log\n"
+                      "# ========================\n"
+                      "# Log entry: tttttttttt:ss nnnn [LS] [M]\n"
+                      "# tttttttttt = Unix time (seconds after epoch)\n"
+                      "# ss = shot number within current second\n"
+                      "# nnnn = how many pixels changed by amount greater than noise\n"
+                      "# LS = lightswitch change detected\n"
+                      "# M = camera moving (or treated as moving)\n"
+                      "#\n",
+                      cnt->changes_log);
+            }
+        }
+    }
+
     /* Initialize stream server if stream port is specified to not 0 */
     if (cnt->conf.stream_port) {
         if (stream_init(cnt) == -1) {
@@ -1347,6 +1370,11 @@ static void motion_cleanup(struct context *cnt)
 #endif
 
     image_ring_destroy(cnt); /* Cleanup the precapture ring buffer */
+
+    if (cnt->changes_log != NULL) {
+        fclose(cnt->changes_log);
+        cnt->changes_log = NULL;
+    }
 
     rotate_deinit(cnt); /* cleanup image rotation data */
 
@@ -1808,7 +1836,8 @@ static int mlp_capture(struct context *cnt){
 }
 
 static void mlp_detection(struct context *cnt){
-
+    int log_diffs = -1;
+    int log_lightswitch = 0;
 
     /***** MOTION LOOP - MOTION DETECTION SECTION *****/
     /*
@@ -1834,6 +1863,8 @@ static void mlp_detection(struct context *cnt){
             else
                 cnt->current_image->diffs = alg_diff(cnt, cnt->imgs.image_virgin);
 
+            log_diffs = cnt->current_image->diffs;
+
             /* Lightswitch feature - has light intensity changed?
              * This can happen due to change of light conditions or due to a sudden change of the camera
              * sensitivity. If alg_lightswitch detects lightswitch we suspend motion detection the next
@@ -1849,6 +1880,7 @@ static void mlp_detection(struct context *cnt){
 
                     cnt->current_image->diffs = 0;
                     alg_update_reference_frame(cnt, RESET_REF_FRAME);
+                    log_lightswitch = 1;
                 }
             }
 
@@ -1902,6 +1934,14 @@ static void mlp_detection(struct context *cnt){
         alg_tune_smartmask(cnt);
         cnt->smartmask_count = cnt->smartmask_ratio;
     }
+
+    if (cnt->changes_log != NULL && log_diffs >= 0)
+        fprintf(cnt->changes_log, "%ld:%02d %d%s%s\n",
+                cnt->current_image->timestamp_tv.tv_sec,
+                cnt->current_image->shot,
+                log_diffs,
+                log_lightswitch ? " LS" : "",
+                cnt->moved ? " M" : "");
 
     /*
      * cnt->moved is set by the tracking code when camera has been asked to move.

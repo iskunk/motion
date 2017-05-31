@@ -43,6 +43,7 @@ struct config conf_template = {
     .rotate_deg =                      0,
     .max_changes =                     DEF_CHANGES,
     .threshold_tune =                  0,
+    .changes_log_file =                NULL,
     .output_pictures =                 "on",
     .motion_img =                      0,
     .emulate_motion =                  0,
@@ -549,6 +550,14 @@ config_param config_params[] = {
     CONF_OFFSET(threshold_tune),
     copy_bool,
     print_bool
+    },
+    {
+    "changes_log_file",
+    "# Write the number of changed pixels for every frame to this file (default: off)",
+    0,
+    CONF_OFFSET(changes_log_file),
+    copy_string,
+    print_string
     },
     {
     "noise_level",

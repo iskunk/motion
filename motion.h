@@ -530,6 +530,7 @@ struct context {
     unsigned int passflag;  //only purpose is to flag first frame vs all others.....
     int rolling_frame;
 
+    FILE *changes_log;
 };
 
 extern pthread_mutex_t global_lock;
