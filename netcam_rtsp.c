@@ -136,7 +136,7 @@ static int rtsp_decode_video(AVPacket *packet, AVFrame *frame, AVCodecContext *c
         MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Error decoding packet: %s",errstr);
         return -1;
     }
-    if (check == 0 || retcd == 0) return 0;
+    if (check == 0) return 0;
     return 1;
 
 #endif

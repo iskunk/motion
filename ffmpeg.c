@@ -1367,6 +1367,13 @@ int ffmpeg_put_packets(struct ffmpeg *ffmpeg, struct packet_buff *buffer, struct
     int retcd = 0;
     int i;
 
+    /*
+     * XXX: handle case of one packet, multiple frames---
+     * but this breaks subtitle packet handling!
+     */
+    if (imgdata->packet_serial == ffmpeg->last_packet_serial)
+        return 0;
+
     assert(buffer->count > 0);
     assert(imgdata->packet_serial >= buffer->array[0].pos);
     assert(imgdata->packet_serial > ffmpeg->last_packet_serial);
