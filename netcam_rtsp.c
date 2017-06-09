@@ -97,22 +97,12 @@ static int rtsp_decode_video(AVPacket *packet, AVFrame *frame, AVCodecContext *c
 
     retcd = avcodec_receive_frame(ctx_codec, frame);
 
-    /* Ensure that we get a frame from every "key" packet
-     */
-    assert(!packet || retcd != AVERROR(EAGAIN) || !(packet->flags & AV_PKT_FLAG_KEY));
-
     if (retcd == AVERROR(EAGAIN)) return 0;
     if (retcd < 0) {
         av_strerror(retcd, errstr, sizeof(errstr));
         MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO, "%s: Error receiving frame from codec: %s", errstr);
         return -1;
     }
-
-    /* Ensure that "have an I-frame" corresponds exactly with
-     * "have a packet, and its 'key' flag is set"
-     */
-    assert((frame->pict_type == AV_PICTURE_TYPE_I) ==
-           (packet && packet->flags & AV_PKT_FLAG_KEY));
 
     return 1;
 
